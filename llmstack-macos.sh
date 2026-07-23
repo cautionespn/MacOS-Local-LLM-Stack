@@ -59,6 +59,18 @@ ZSHRC="$HOME/.zshrc"
 ALIAS_START_MARKER="### LLM Stack Control (llmstack-macos.sh) ###"
 ALIAS_END_MARKER="### End LLM Stack Control ###"
 
+# Start markers written by earlier versions of this tooling. A re-run must
+# find and remove these too, otherwise a second block is appended and the
+# old definitions collide with the new ones. Older blocks defined llmstop
+# and llmstart as ALIASES; the current ones are FUNCTIONS, and zsh expands
+# a live alias while parsing a function of the same name, which produces
+# "defining function based on alias" followed by a parse error.
+LEGACY_START_MARKERS=(
+  "### LLM Stack Control (auto-generated) ###"
+  "# --- Local LLM stack control ---"
+  "# ============================================================"
+)
+
 # Defaults, overridable by flags or by an existing config file.
 SEARXNG_MODE="local"
 SEARXNG_HOST_PORT="8888"
@@ -84,6 +96,78 @@ confirm() {
     [yY]|[yY][eE][sS]) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# .zshrc block management
+# ---------------------------------------------------------------------------
+ZSHRC_BACKED_UP="no"
+
+backup_zshrc() {
+  [ -f "$ZSHRC" ] || return 0
+  [ "$ZSHRC_BACKED_UP" = "yes" ] && return 0
+  local dest="${ZSHRC}.backup-$(date +%Y%m%d-%H%M%S)"
+  cp "$ZSHRC" "$dest"
+  ZSHRC_BACKED_UP="yes"
+  log "Backed up .zshrc to $dest"
+}
+
+# Delete the inclusive range from a start marker to the end marker.
+# Uses awk with index() for literal matching, so marker text containing
+# regex metacharacters is handled correctly.
+remove_zshrc_range() {
+  local start="$1" end="$2" tmp
+  [ -f "$ZSHRC" ] || return 0
+  grep -qF "$start" "$ZSHRC" || return 0
+
+  if ! grep -qF "$end" "$ZSHRC"; then
+    warn "Found a shell block starting with:"
+    echo "      $start"
+    echo "    but no matching end marker. Removing it automatically would"
+    echo "    mean guessing where it ends, so it is being left alone."
+    echo ""
+    echo "    Delete it by hand from $ZSHRC, then re-run this script."
+    echo "    Leaving it in place will collide with the new definitions."
+    return 1
+  fi
+
+  backup_zshrc
+  tmp="$(mktemp)"
+  awk -v s="$start" -v e="$end" '
+    index($0, s) { skip = 1 }
+    !skip        { print }
+    skip && index($0, e) { skip = 0 }
+  ' "$ZSHRC" > "$tmp"
+  mv "$tmp" "$ZSHRC"
+  log "Removed an existing shell block: $start"
+  return 0
+}
+
+# Remove the current block and every known legacy block. Returns non-zero if
+# something was found that could not be removed safely.
+purge_zshrc_blocks() {
+  local rc=0 marker
+  remove_zshrc_range "$ALIAS_START_MARKER" "$ALIAS_END_MARKER" || rc=1
+  for marker in "${LEGACY_START_MARKERS[@]}"; do
+    remove_zshrc_range "$marker" "$ALIAS_END_MARKER" || rc=1
+  done
+  return "$rc"
+}
+
+# Warn about llm* aliases or functions defined outside any marked block.
+# These cannot be removed automatically because their extent is unknown.
+check_stray_llm_defs() {
+  [ -f "$ZSHRC" ] || return 0
+  if grep -qE '^[[:space:]]*alias[[:space:]]+llm(stop|start|status|upgrade)=' "$ZSHRC"; then
+    warn "Found llm* ALIAS definitions in .zshrc outside any marked block."
+    echo "    The current stack defines these as functions. zsh expands a"
+    echo "    live alias while parsing a function of the same name, which"
+    echo "    fails with 'defining function based on alias'."
+    echo ""
+    echo "    Remove these lines from $ZSHRC before starting a new shell:"
+    grep -nE '^[[:space:]]*alias[[:space:]]+llm(stop|start|status|upgrade)=' "$ZSHRC" \
+      | sed 's/^/      /'
+  fi
 }
 
 # ===========================================================================
@@ -836,27 +920,21 @@ BANNER
   fi
 
   log "Step 10: Remove the shell commands from .zshrc"
-  if [ -f "$ZSHRC" ] && grep -qF "$ALIAS_START_MARKER" "$ZSHRC"; then
-    if grep -qF "$ALIAS_END_MARKER" "$ZSHRC"; then
-      echo "    Removes the marked block. A timestamped backup of .zshrc is"
-      echo "    written first."
-      if confirm "Remove the block from .zshrc?"; then
-        cp "$ZSHRC" "${ZSHRC}.backup-$(date +%Y%m%d-%H%M%S)"
-        sed -i '' "/$ALIAS_START_MARKER/,/$ALIAS_END_MARKER/d" "$ZSHRC"
-        log "Block removed; a .zshrc backup was kept alongside it."
-        echo "    Run 'exec zsh' for this to take effect."
-      else
-        log "Skipped."
-      fi
+  if [ -f "$ZSHRC" ] && grep -qF "$ALIAS_END_MARKER" "$ZSHRC"; then
+    echo "    Removes the marked block, including any left by earlier"
+    echo "    versions. A timestamped backup of .zshrc is written first."
+    if confirm "Remove the block from .zshrc?"; then
+      purge_zshrc_blocks || true
+      check_stray_llm_defs
+      echo "    Run 'exec zsh' for this to take effect. Sourcing .zshrc is"
+      echo "    not enough; definitions already in the shell persist until"
+      echo "    the shell itself is replaced."
     else
-      warn "Found the start marker but no end marker in .zshrc."
-      echo "    Removing it automatically would mean guessing where the block"
-      echo "    ends, so this step is being skipped. Remove it by hand from"
-      echo "    $ZSHRC, starting at the line:"
-      echo "      $ALIAS_START_MARKER"
+      log "Skipped."
     fi
   else
-    log "No shell block found."
+    log "No removable shell block found."
+    check_stray_llm_defs
   fi
 
   log "Step 11: Remove configuration and the model catalogue"
@@ -1381,10 +1459,18 @@ write_config
 
 # --- shell integration -----------------------------------------------------
 log "Configuring shell commands"
-if grep -qF "$ALIAS_START_MARKER" "$ZSHRC" 2>/dev/null; then
-  log "Shell commands already present in .zshrc; leaving them alone."
+check_stray_llm_defs
+if purge_zshrc_blocks; then
+  ZSHRC_SAFE="yes"
 else
-  log "Adding llmstatus, llmstart, llmstop and llmupgrade to .zshrc"
+  ZSHRC_SAFE="no"
+fi
+
+if [ "$ZSHRC_SAFE" = "no" ]; then
+  warn "Skipping the .zshrc update because an existing block could not be"
+  echo "    removed safely. Resolve the note above and re-run to finish."
+else
+  log "Writing llmstatus, llmstart, llmstop and llmupgrade to .zshrc"
   SCRIPT_ABS="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
   {
     printf '\n%s\n' "$ALIAS_START_MARKER"
@@ -1499,6 +1585,9 @@ cat <<DONE
   Next steps:
     1. exec zsh
        Loads llmstatus, llmstart, llmstop and llmupgrade.
+       Use exec zsh, not 'source ~/.zshrc'. Sourcing cannot clear
+       definitions already present in a running shell, and an alias
+       left over from an older install will break the new functions.
 
     2. Open the Open WebUI address above and create the admin account.
        The first account created becomes the owner, so do this before
