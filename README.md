@@ -289,6 +289,10 @@ Colima      (runtime)  UP
 
 Settings are read from `~/.config/llmstack/config` at call time, not baked into `.zshrc` — so changing the SearXNG URL means editing one line in one file.
 
+The block is delimited by start and end markers. Re-running the installer **replaces** it rather than appending a second copy, backing up `.zshrc` first, and it recognises markers written by earlier versions of this tooling.
+
+> **Use `exec zsh`, not `source ~/.zshrc`.** Sourcing cannot clear definitions already resident in a running shell. If an older install defined these as aliases, sourcing the new file mid-session produces `defining function based on alias` followed by a parse error. See [Troubleshooting](#defining-function-based-on-alias-llmstop--parse-error-in-zshrc).
+
 ---
 
 ## Updating
@@ -361,6 +365,33 @@ Open WebUI binds to all interfaces deliberately so phones and laptops can use it
 ## Troubleshooting
 
 Every item here is a failure that actually occurred during development, with the diagnosis that resolved it.
+
+### `defining function based on alias 'llmstop'` / parse error in `.zshrc`
+
+Older versions of this tooling defined `llmstop` and `llmstart` as **aliases**; current versions define them as **functions**. zsh expands a live alias while parsing a function of the same name, so the definition collapses into garbage and the parse fails.
+
+Two separate causes, and they need different fixes.
+
+**Stale definitions in the running shell.** Sourcing `.zshrc` cannot remove an alias that's already in memory — it persists until the shell is replaced. If the file is correct but the error persists:
+
+```bash
+alias llmstop        # prints something? it's stale session state
+exec zsh             # replaces the shell; source is not enough
+```
+
+**A leftover block on disk.** Check for more than one:
+
+```bash
+grep -n 'LLM Stack Control\|alias llmstop\|^llmstop()' ~/.zshrc
+```
+
+Current versions of the script detect and remove blocks left by earlier versions, so re-running `--install` resolves this. Definitions found *outside* a marked block can't be removed automatically — the script reports them with line numbers for you to delete.
+
+If nothing turns up in `.zshrc` itself, check what oh-my-zsh loads implicitly. With `ZSH_CUSTOM` unset it defaults to `$ZSH/custom`, and **every `.zsh` file there is sourced at startup**:
+
+```bash
+grep -rn "llmstop\|llmstart" ~/.oh-my-zsh/custom/ ~/.zshenv ~/.zprofile ~/.zlogin 2>/dev/null
+```
 
 ### Open WebUI won't start: `Read-only file system: '/.webui_secret_key'`
 
