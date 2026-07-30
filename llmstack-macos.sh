@@ -1,6 +1,7 @@
+```bash
 #!/bin/bash
 #
-# llmstack-macos.sh  v3.1
+# llmstack-macos.sh  v3.1.1
 #
 # A self-contained, private LLM stack for macOS on Apple Silicon.
 #
@@ -22,7 +23,7 @@ set -euo pipefail
 # Constants
 # ---------------------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="3.1"
+SCRIPT_VERSION="3.1.1"
 CATALOG_DATE="2025-01-15"
 CATALOG_WARN_DAYS=90
 CATALOG_STALE_DAYS=180
@@ -111,9 +112,16 @@ validate_port() {
   fi
 }
 
+# Check whether a TCP port is in use. If it is, echo the process name and
+# PID of the holder so the caller can report it, and return 0. If the port
+# is free, return 1 without printing anything.
 port_in_use() {
   local port="$1"
-  lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+  local holder
+  holder="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $1, $2}' | head -1)"
+  [ -n "$holder" ] || return 1
+  echo "$holder"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -685,7 +693,17 @@ do_update() {
   sudo launchctl bootstrap system "$OLLAMA_PLIST" 2>/dev/null || true
   sudo launchctl bootstrap system "$OPENWEBUI_PLIST" 2>/dev/null || true
   log "Waiting for services"
-  sleep 20
+  # Poll for readiness rather than sleeping a fixed duration. Each curl
+  # has --max-time so a hung service doesn't block indefinitely.
+  for i in $(seq 1 30); do
+    if curl -s -o /dev/null --max-time 2 http://127.0.0.1:11434/api/version 2>/dev/null \
+       && curl -s -o /dev/null --max-time 2 "http://127.0.0.1:${WEBUI_PORT}" 2>/dev/null; then
+      ok "Services are up."
+      break
+    fi
+    sleep 2
+    [ "$i" -eq 30 ] && warn "Services not fully up after 60 seconds. Check the logs."
+  done
   cat <<UPDATED
 ===========================================================================
   UPDATE COMPLETE
@@ -1035,15 +1053,20 @@ cat <<DETECTED
 DETECTED
 
 # --- port conflict check ---------------------------------------------------
-if port_in_use "$WEBUI_PORT"; then
+# Report not just that the port is busy, but what holds it, so the user
+# can decide what to kill or reconfigure.
+local holder
+if holder="$(port_in_use "$WEBUI_PORT")"; then
   warn "Port ${WEBUI_PORT} is already in use."
-  echo "    Another process is listening on :${WEBUI_PORT}. Open WebUI will fail."
+  echo "    Held by: $holder"
   echo "    Free the port, or re-run with --webui-port <other-port>."
 fi
-if [ "$SEARXNG_MODE" = "local" ] && port_in_use "$SEARXNG_HOST_PORT"; then
-  warn "Port ${SEARXNG_HOST_PORT} is already in use."
-  echo "    Another process is listening on :${SEARXNG_HOST_PORT}. SearXNG will fail."
-  echo "    Free the port, or re-run with --searxng-port <other-port>."
+if [ "$SEARXNG_MODE" = "local" ]; then
+  if holder="$(port_in_use "$SEARXNG_HOST_PORT")"; then
+    warn "Port ${SEARXNG_HOST_PORT} is already in use."
+    echo "    Held by: $holder"
+    echo "    Free the port, or re-run with --searxng-port <other-port>."
+  fi
 fi
 
 # --- choose a model --------------------------------------------------------
@@ -1500,3 +1523,4 @@ cat <<DONE
   Uninstall:      ./${SCRIPT_NAME} --uninstall
 ===========================================================================
 DONE
+```
