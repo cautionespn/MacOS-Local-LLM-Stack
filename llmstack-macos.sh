@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# llmstack-macos.sh
+# llmstack-macos.sh  v3.1
 #
 # A self-contained, private LLM stack for macOS on Apple Silicon.
 #
@@ -16,17 +16,14 @@
 # Run  ./llmstack-macos.sh --help  for full documentation.
 #
 # License: public domain / CC0. Share and modify freely.
-
 set -euo pipefail
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="3.0"
-
-# Date the bundled model catalogue was last curated by hand.
-# Bump this whenever the DEFAULT_CATALOG below is revised.
-CATALOG_DATE="2026-07-23"
-
-# Staleness thresholds, in days.
+SCRIPT_VERSION="3.1"
+CATALOG_DATE="2025-01-15"
 CATALOG_WARN_DAYS=90
 CATALOG_STALE_DAYS=180
 
@@ -37,34 +34,24 @@ CONFIG_DIR="$HOME/.config/llmstack"
 CONFIG_FILE="$CONFIG_DIR/config"
 CATALOG="$CONFIG_DIR/models.catalog"
 SECRET_FILE="$CONFIG_DIR/openwebui-secret"
-
 VENV_DIR="$HOME/openwebui-venv"
 DATA_DIR="$HOME/.local/share/open-webui/data"
 OLLAMA_MODELS_DIR="$HOME/.ollama/models"
 SEARXNG_DIR="$HOME/.searxng"
 SEARXNG_SETTINGS="$SEARXNG_DIR/settings.yml"
-
 OLLAMA_PLIST="/Library/LaunchDaemons/com.local.ollama.plist"
 OPENWEBUI_PLIST="/Library/LaunchDaemons/com.local.openwebui.plist"
 OLLAMA_LABEL="com.local.ollama"
 OPENWEBUI_LABEL="com.local.openwebui"
-
 PYTHON_FORMULA="python@3.11"
 PYTHON_BIN="/opt/homebrew/opt/python@3.11/bin/python3.11"
 DRAWTHINGS_APP="/Applications/Draw Things.app"
 DRAWTHINGS_ID="6444050820"
 SEARXNG_IMAGE="ghcr.io/searxng/searxng:latest"
-
 ZSHRC="$HOME/.zshrc"
 ALIAS_START_MARKER="### LLM Stack Control (llmstack-macos.sh) ###"
 ALIAS_END_MARKER="### End LLM Stack Control ###"
 
-# Start markers written by earlier versions of this tooling. A re-run must
-# find and remove these too, otherwise a second block is appended and the
-# old definitions collide with the new ones. Older blocks defined llmstop
-# and llmstart as ALIASES; the current ones are FUNCTIONS, and zsh expands
-# a live alias while parsing a function of the same name, which produces
-# "defining function based on alias" followed by a parse error.
 LEGACY_START_MARKERS=(
   "### LLM Stack Control (auto-generated) ###"
   "# --- Local LLM stack control ---"
@@ -81,12 +68,28 @@ WEBUI_BIND="0.0.0.0"
 SKIP_DRAWTHINGS="no"
 SKIP_MODEL="no"
 FORCE_MODEL=""
+ACTUAL_USER="$(id -un)"
 
-ACTUAL_USER="$(whoami)"
+# ---------------------------------------------------------------------------
+# Color support (auto-detected; safe to pipe to non-terminals)
+# ---------------------------------------------------------------------------
+if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
+  C_BOLD="$(tput bold)"
+  C_RED="$(tput setaf 1)"
+  C_YELLOW="$(tput setaf 3)"
+  C_GREEN="$(tput setaf 2)"
+  C_RESET="$(tput sgr0)"
+else
+  C_BOLD="" C_RED="" C_YELLOW="" C_GREEN="" C_RESET=""
+fi
 
-log()   { printf '\n==> %s\n' "$1"; }
-warn()  { printf '\nWARNING: %s\n' "$1" >&2; }
-error() { printf '\nERROR: %s\n' "$1" >&2; exit 1; }
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+log()   { printf '\n%s==>%s %s\n' "$C_BOLD" "$C_RESET" "$1"; }
+warn()  { printf '\n%sWARNING:%s %s\n' "$C_YELLOW" "$C_RESET" "$1" >&2; }
+error() { printf '\n%sERROR:%s %s\n' "$C_RED" "$C_RESET" "$1" >&2; exit 1; }
+ok()    { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$1"; }
 
 confirm() {
   local reply
@@ -97,6 +100,39 @@ confirm() {
     *) return 1 ;;
   esac
 }
+
+# ---------------------------------------------------------------------------
+# Input validation
+# ---------------------------------------------------------------------------
+validate_port() {
+  local p="$1"
+  if ! [[ "$p" =~ ^[0-9]+$ ]] || [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
+    error "Invalid port: '$p' (must be 1–65535)"
+  fi
+}
+
+port_in_use() {
+  local port="$1"
+  lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# Error trap — report partial state on unexpected exit
+# ---------------------------------------------------------------------------
+INSTALL_STARTED="no"
+on_error() {
+  local rc=$?
+  if [ "$INSTALL_STARTED" = "yes" ] && [ "$rc" -ne 0 ]; then
+    printf '\n%s\n' "${C_RED}==========================================================${C_RESET}"
+    printf '%sThe script exited with an error (code %d).%s\n' "${C_RED}" "$rc" "${C_RESET}"
+    printf '%sPartial state may remain. Re-running is safe (the script is idempotent).%s\n' "${C_RED}" "${C_RESET}"
+    printf '%sIf the error is not obvious, check the logs:%s\n' "${C_RED}" "${C_RESET}"
+    printf '  Ollama:     %s/.ollama/ollama.daemon.err.log\n' "$HOME"
+    printf '  Open WebUI: %s/openwebui.err.log\n' "$DATA_DIR"
+    printf '%s==========================================================%s\n' "${C_RED}" "${C_RESET}"
+  fi
+}
+trap on_error EXIT
 
 # ---------------------------------------------------------------------------
 # .zshrc block management
@@ -112,14 +148,10 @@ backup_zshrc() {
   log "Backed up .zshrc to $dest"
 }
 
-# Delete the inclusive range from a start marker to the end marker.
-# Uses awk with index() for literal matching, so marker text containing
-# regex metacharacters is handled correctly.
 remove_zshrc_range() {
   local start="$1" end="$2" tmp
   [ -f "$ZSHRC" ] || return 0
   grep -qF "$start" "$ZSHRC" || return 0
-
   if ! grep -qF "$end" "$ZSHRC"; then
     warn "Found a shell block starting with:"
     echo "      $start"
@@ -130,7 +162,6 @@ remove_zshrc_range() {
     echo "    Leaving it in place will collide with the new definitions."
     return 1
   fi
-
   backup_zshrc
   tmp="$(mktemp)"
   awk -v s="$start" -v e="$end" '
@@ -143,8 +174,6 @@ remove_zshrc_range() {
   return 0
 }
 
-# Remove the current block and every known legacy block. Returns non-zero if
-# something was found that could not be removed safely.
 purge_zshrc_blocks() {
   local rc=0 marker
   remove_zshrc_range "$ALIAS_START_MARKER" "$ALIAS_END_MARKER" || rc=1
@@ -154,8 +183,6 @@ purge_zshrc_blocks() {
   return "$rc"
 }
 
-# Warn about llm* aliases or functions defined outside any marked block.
-# These cannot be removed automatically because their extent is unknown.
 check_stray_llm_defs() {
   [ -f "$ZSHRC" ] || return 0
   if grep -qE '^[[:space:]]*alias[[:space:]]+llm(stop|start|status|upgrade)=' "$ZSHRC"; then
@@ -173,20 +200,6 @@ check_stray_llm_defs() {
 # ===========================================================================
 # MODEL CATALOGUE
 # ===========================================================================
-# Written to $CATALOG on first run if that file does not exist. It is never
-# overwritten afterwards, so local edits survive upgrades of this script.
-#
-# Data line format, pipe separated:
-#   MIN_RAM_GB | TAG | SIZE_GB | ARCH | ROLE | VERIFIED | NOTES
-#
-#   MIN_RAM_GB  smallest machine this entry is sensible on
-#   TAG         exact ollama pull tag
-#   SIZE_GB     on-disk / in-memory size of the quantised weights
-#   ARCH        moe or dense
-#   ROLE        daily, coding, vision or light
-#   VERIFIED    yes if the tag was confirmed against the Ollama registry
-#   NOTES       free text, no pipe characters
-
 write_default_catalog() {
   mkdir -p "$CONFIG_DIR"
   cat > "$CATALOG" <<CATALOG_EOF
@@ -225,22 +238,26 @@ write_default_catalog() {
 #
 # Format: MIN_RAM_GB|TAG|SIZE_GB|ARCH|ROLE|VERIFIED|NOTES
 # ===========================================================================
-
 # --- Daily drivers ---------------------------------------------------------
-48|qwen3.6:35b-a3b|24|moe|daily|yes|35B total with about 3B active per token. Fast on Apple Silicon.
-32|qwen3.6:35b-a3b|24|moe|daily|yes|Fits with limited headroom for long context.
-16|gemma4:26b-a4b|16|moe|daily|no|Smaller MoE alternative. Verify the tag before relying on it.
-8|qwen3.6:8b|5|dense|light|no|Small dense model for constrained machines.
-
+48|qwen2.5:32b-instruct|19|dense|daily|yes|Strong general-purpose model. Fits comfortably with headroom for long context.
+32|qwen2.5:32b-instruct|19|dense|daily|yes|Fits with limited headroom for long context.
+16|qwen2.5:14b-instruct|9|dense|daily|yes|Solid mid-size model for 16 GB machines.
+8|qwen2.5:7b-instruct|5|dense|light|yes|Fast and capable for constrained machines.
+8|llama3.2:3b|2|dense|light|yes|Very small, very fast. Good fallback for 8 GB machines.
 # --- Coding ----------------------------------------------------------------
-48|qwen3.6:27b|20|dense|coding|no|Dense model aimed at code. Verify the tag.
-32|qwen3.6:14b|9|dense|coding|no|Lighter coding option.
-
+48|qwen2.5-coder:32b-instruct|19|dense|coding|yes|Code-specialised. Excellent for programming tasks.
+32|qwen2.5-coder:14b-instruct|9|dense|coding|yes|Lighter coding option.
+16|qwen2.5-coder:14b-instruct|9|dense|coding|yes|Good coding model for 16 GB machines.
+8|qwen2.5-coder:7b-instruct|5|dense|coding|yes|Small coding model.
 # --- Large dense, high memory only ----------------------------------------
-96|llama3.3:70b|43|dense|daily|no|Dense 70B. Slow on anything below Max tier. Verify the tag.
-
+96|llama3.1:70b|43|dense|daily|yes|Dense 70B. Slow on anything below Max tier.
+64|llama3.1:70b|43|dense|daily|yes|Fits on 64 GB but tight. Consider qwen2.5:32b instead.
 # --- Vision ----------------------------------------------------------------
-32|gemma4:26b-a4b|16|moe|vision|no|Multimodal. Verify the tag.
+32|llama3.2-vision:11b|7|dense|vision|yes|Multimodal vision-language model.
+16|llama3.2-vision:11b|7|dense|vision|yes|Vision model for 16 GB machines.
+# --- MoE (preferred for bandwidth-limited chips) ---------------------------
+48|mixtral:8x7b|26|moe|daily|yes|8-expert MoE. Fast inference, large weights.
+32|qwen2.5:32b-instruct|19|dense|daily|yes|Dense alternative if Mixtral is too large.
 CATALOG_EOF
 }
 
@@ -251,13 +268,11 @@ ensure_catalog() {
   fi
 }
 
-# Echo the catalogue's Last-Updated date, or empty if unreadable.
 catalog_date() {
   [ -f "$CATALOG" ] || return 0
   grep -m1 '^# Last-Updated:' "$CATALOG" 2>/dev/null | awk '{print $3}'
 }
 
-# Echo the catalogue age in whole days, or empty if it cannot be computed.
 catalog_age_days() {
   local d cat_epoch now_epoch
   d="$(catalog_date)"
@@ -271,20 +286,16 @@ report_catalog_age() {
   local d age
   d="$(catalog_date)"
   age="$(catalog_age_days)"
-
   if [ -z "$d" ]; then
     warn "The catalogue has no readable 'Last-Updated:' line."
     echo "    Add one in the form:  # Last-Updated: YYYY-MM-DD"
     return 0
   fi
-
   if [ -z "$age" ]; then
     warn "Could not parse the catalogue date '$d'. Expected YYYY-MM-DD."
     return 0
   fi
-
   printf '\nModel catalogue last updated: %s (%s days ago)\n' "$d" "$age"
-
   if [ "$age" -ge "$CATALOG_STALE_DAYS" ]; then
     printf '\n'
     printf '  This catalogue is over %s days old and is very likely stale.\n' "$CATALOG_STALE_DAYS"
@@ -304,21 +315,15 @@ report_catalog_age() {
 # ===========================================================================
 # SYSTEM DETECTION
 # ===========================================================================
-# Sets: SYS_CHIP SYS_TIER SYS_RAM_GB SYS_USABLE_GB SYS_DISK_FREE_GB SYS_CORES
 detect_system() {
   SYS_CHIP="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo 'unknown')"
   SYS_CORES="$(sysctl -n hw.ncpu 2>/dev/null || echo '?')"
-
   local mem_bytes
   mem_bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
   SYS_RAM_GB=$(( mem_bytes / 1024 / 1024 / 1024 ))
-
-  # About 70 percent of unified memory is usable for weights.
   SYS_USABLE_GB=$(( SYS_RAM_GB * 70 / 100 ))
-
   SYS_DISK_FREE_GB="$(df -g "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')"
   [ -n "$SYS_DISK_FREE_GB" ] || SYS_DISK_FREE_GB=0
-
   case "$SYS_CHIP" in
     *Ultra*) SYS_TIER="Ultra" ;;
     *Max*)   SYS_TIER="Max" ;;
@@ -338,7 +343,6 @@ bandwidth_note() {
   esac
 }
 
-# Echo the best catalogue line for a role, or empty if nothing fits.
 best_for_role() {
   local role="$1"
   [ -f "$CATALOG" ] || return 0
@@ -348,11 +352,6 @@ best_for_role() {
     {
       gsub(/^[ \t]+|[ \t]+$/, "", $2)
       gsub(/^[ \t]+|[ \t]+$/, "", $5)
-      # Two independent gates:
-      #   $1 MIN_RAM_GB  the machine class an entry is sensible on. Guards
-      #                  against picking a large dense model that merely
-      #                  fits but is bandwidth-starved on a lesser chip.
-      #   $3 SIZE_GB     must fit the usable weight budget.
       if ($5 == want && ($1 + 0) <= ram && ($3 + 0) <= budget && ($3 + 0) > best) {
         best = $3 + 0
         line = $0
@@ -364,12 +363,54 @@ best_for_role() {
 
 field() { echo "$1" | awk -F'|' -v n="$2" '{gsub(/^[ \t]+|[ \t]+$/, "", $n); print $n}'; }
 
+# ---------------------------------------------------------------------------
+# Shared status logic — single source of truth for show_status AND .zshrc
+# ---------------------------------------------------------------------------
+STATUS_BODY='
+_llmstack_conf() {
+  SEARXNG_MODE="local"
+  SEARXNG_URL="http://127.0.0.1:8888"
+  WEBUI_PORT="8080"
+  [ -f "$HOME/.config/llmstack/config" ] && . "$HOME/.config/llmstack/config"
+}
+_llmstack_status() {
+  _llmstack_conf
+  local ollama webui searxng colima
+  if curl -s -o /dev/null --max-time 3 http://127.0.0.1:11434/api/version; then
+    ollama="UP"
+  else
+    ollama="DOWN"
+  fi
+  if curl -s -o /dev/null --max-time 3 "http://127.0.0.1:${WEBUI_PORT}"; then
+    webui="UP"
+  else
+    webui="DOWN"
+  fi
+  if curl -s -o /dev/null --max-time 5 "${SEARXNG_URL}/search?q=test&format=json"; then
+    searxng="UP"
+  else
+    searxng="DOWN"
+  fi
+  printf "Ollama      (:11434)   %s\n" "$ollama"
+  printf "Open WebUI  (:%s)    %s\n" "$WEBUI_PORT" "$webui"
+  if [ "$SEARXNG_MODE" = "local" ]; then
+    if colima status >/dev/null 2>&1; then colima="UP"; else colima="DOWN"; fi
+    printf "Colima      (runtime)  %s\n" "$colima"
+    printf "SearXNG     (local)    %s\n" "$searxng"
+    if [ "$colima" = "DOWN" ]; then
+      printf "\nColima needs a console login session. After a reboot with\n"
+      printf "nobody logged in at the screen, it and SearXNG stay down.\n"
+    fi
+  else
+    printf "SearXNG     (remote)   %s   %s\n" "$searxng" "$SEARXNG_URL"
+  fi
+}
+'
+
 show_recommendations() {
   detect_system
   ensure_catalog
-
   cat <<SYSINFO
-
 ===========================================================================
   DETECTED SYSTEM
 ===========================================================================
@@ -379,13 +420,10 @@ show_recommendations() {
   Unified memory:    ${SYS_RAM_GB} GB
   Usable for models: ~${SYS_USABLE_GB} GB  (about 70 percent)
   Free disk:         ${SYS_DISK_FREE_GB} GB
-
   $(bandwidth_note)
 ===========================================================================
-
 RECOMMENDED MODELS
 SYSINFO
-
   local role line tag size arch verified notes found
   found="no"
   for role in daily coding vision light; do
@@ -404,14 +442,11 @@ SYSINFO
     fi
     printf '\n           %s\n' "$notes"
   done
-
   if [ "$found" = "no" ]; then
     printf '\n  Nothing in the catalogue fits a %s GB budget.\n' "$SYS_USABLE_GB"
     printf '  Add a smaller entry to %s\n' "$CATALOG"
   fi
-
   report_catalog_age
-
   printf 'Catalogue file: %s\n' "$CATALOG"
   printf 'Edit it to change these recommendations.\n\n'
 }
@@ -431,11 +466,11 @@ write_config() {
   cat > "$CONFIG_FILE" <<CONFIG_EOF
 # llmstack-macos.sh configuration
 # Written by the installer. Safe to edit; the shell functions read it.
-
 SEARXNG_MODE="${SEARXNG_MODE}"
 SEARXNG_URL="${SEARXNG_URL}"
 SEARXNG_HOST_PORT="${SEARXNG_HOST_PORT}"
 WEBUI_PORT="${WEBUI_PORT}"
+WEBUI_BIND="${WEBUI_BIND}"
 CONFIG_EOF
 }
 
@@ -445,71 +480,54 @@ CONFIG_EOF
 show_help() {
   cat <<HELPTEXT
 ${SCRIPT_NAME} v${SCRIPT_VERSION}
-
 NAME
     ${SCRIPT_NAME} - install and manage a private, self-hosted LLM stack
     on macOS running on Apple Silicon.
-
 SYNOPSIS
     ./${SCRIPT_NAME} [MODE] [OPTIONS]
-
 DESCRIPTION
     Installs a complete local AI stack: Ollama for inference, Open WebUI as
     the front-end, SearXNG for private web search, and optionally Draw
     Things for image generation. Nothing leaves the machine unless a web
     search is performed.
-
     Before installing, the script inspects the host's chip, memory and free
     disk, then consults a model catalogue to choose a model that actually
     fits. The catalogue is a plain text file you own and can edit; it
     carries a date, and the script reports how stale it has become.
-
     The script is idempotent. Re-running it is safe: every step checks
     current state first, and existing data is never overwritten.
-
 MODES
     --install       Install or repair the stack. Default when no mode is
                     given.
-
     --update        Update Ollama, Open WebUI and, in local mode, the
                     SearXNG container image. Backs up Open WebUI data
                     first, then reports the age of the model catalogue.
                     --upgrade is accepted as a synonym.
-
     --status        Print the health of every component and exit. Makes no
                     changes.
-
     --recommend     Print the detected hardware and the models that suit
                     it, then exit. Installs nothing. Useful before
                     committing to a large download.
-
     --uninstall     Guided teardown. Walks every artifact the script
                     created and asks before removing each one. All
                     destructive prompts default to NO.
-
+    --version       Print the script version and exit.
     --help          Show this text and exit.
-
 OPTIONS
     --searxng-url URL
                     Use an existing SearXNG instance instead of installing
                     one locally. Skips Colima and Docker entirely.
                     Example: --searxng-url http://192.168.1.23:8899
-
     --searxng-port PORT
                     Host port for the local SearXNG container.
                     Default ${SEARXNG_HOST_PORT}.
-
     --webui-port PORT
                     Port for Open WebUI. Default ${WEBUI_PORT}.
-
     --model TAG     Install this model instead of the catalogue's
                     recommendation. Skips the fit check.
-
     --no-model      Do not download any model. Useful for setting up the
                     services first and choosing a model later.
-
     --no-drawthings Skip the Draw Things installation.
-
 COMPONENTS
     Homebrew            package manager, installed if missing
     python@3.11         runtime required by Open WebUI
@@ -518,7 +536,6 @@ COMPONENTS
     Colima + docker     container runtime, local SearXNG mode only
     SearXNG             private metasearch, local mode only
     Draw Things         image and video generation, from the Mac App Store
-
 LAYOUT
     ~/.config/llmstack/config             installer settings
     ~/.config/llmstack/models.catalog     model catalogue, yours to edit
@@ -529,65 +546,59 @@ LAYOUT
     ~/.searxng/settings.yml               SearXNG config, local mode only
     /Library/LaunchDaemons/com.local.ollama.plist
     /Library/LaunchDaemons/com.local.openwebui.plist
-
 NETWORK
     Ollama        127.0.0.1:11434    local only
     Open WebUI    ${WEBUI_BIND}:${WEBUI_PORT}       reachable across the LAN
     SearXNG       ${SEARXNG_URL}
                                      local only when self-hosted
-
 STARTUP BEHAVIOUR AND ITS LIMITS
     Ollama and Open WebUI are installed as SYSTEM LaunchDaemons. They load
     in the system domain at boot, need no console login, and are
     privilege-dropped to the invoking user rather than running as root. A
     headless, SSH-only machine comes back fully after a reboot without
     enabling auto-login.
-
     SearXNG in local mode cannot do this. macOS container runtimes require
     an active GUI login session: Docker Desktop is a GUI application and
     cannot be launched over SSH, and Colima manages a per-user virtual
     machine and is not supported as a root or system-level daemon.
-
     So in local mode Colima and SearXNG start in the user domain and will
     not run after a reboot until someone logs in at the console. Ollama and
     Open WebUI will already be up; web search will report DOWN until then.
-
     If reboot-durable search matters, run SearXNG on a Linux host, where
     Docker is a genuine systemd service, and point this machine at it with
     --searxng-url. That mode installs no container runtime at all.
-
 MODEL SELECTION
     Roughly 70 percent of unified memory is usable for model weights; the
     rest goes to macOS, the inference engine and the KV cache. The script
     computes that budget and picks the largest catalogue entry that fits.
-
     Memory bandwidth matters as much as capacity. Token generation is
     bandwidth-bound, so a mixture-of-experts model, which activates only a
     fraction of its parameters per token, generates far faster than a dense
     model of the same size. On base-tier chips this is decisive.
-
     Catalogue entries carry a VERIFIED flag. Tags marked no are plausible
     but unconfirmed and may fail to pull; the script warns first and, if a
     pull fails, points at https://ollama.com/library rather than aborting.
-
 SHELL INTEGRATION
     Adds a marked block to ~/.zshrc providing:
-
       llmstatus     health of every component
       llmstart      start the stack
       llmstop       stop the stack and reclaim memory
       llmupgrade    run this script's --update mode
-
     The block is delimited by markers so --uninstall can remove it
     cleanly. Run 'exec zsh' after installing to load the commands.
-
+SECURITY NOTE
+    The Open WebUI secret key is stored in ~/.config/llmstack/openwebui-secret
+    (mode 0600) and passed to the daemon via the plist EnvironmentVariables
+    dict. System LaunchDaemon plists are readable by all users (0644). If
+    this is a concern on a multi-user machine, set WEBUI_SECRET_KEY in the
+    environment of the user's shell profile instead and remove it from the
+    plist. See the Open WebUI docs for details.
 REQUIREMENTS
     macOS on Apple Silicon (arm64)
     An administrator account; sudo is required for system LaunchDaemons
     Xcode Command Line Tools; the Homebrew installer will prompt if absent
     Signed in to the Mac App Store, for the Draw Things step
     Enough free disk for the chosen model, typically 25 to 45 GB
-
 POST-INSTALL
     1. Run 'exec zsh' to load the shell commands.
     2. Open http://\$(hostname).local:${WEBUI_PORT} and create the admin
@@ -600,31 +611,23 @@ POST-INSTALL
        The URL field only appears once the engine is selected.
     4. If Draw Things was installed, open it and download image models
        from its own model manager.
-
 EXIT STATUS
     0   success
     1   an error occurred; the message describes the failure
-
 EXAMPLES
     ./${SCRIPT_NAME} --recommend
         Inspect the machine and print suitable models. Changes nothing.
-
     ./${SCRIPT_NAME}
         Install with a locally hosted SearXNG.
-
     ./${SCRIPT_NAME} --searxng-url http://192.168.1.23:8899
         Install using an existing SearXNG elsewhere on the network, with
         no container runtime on this machine.
-
     ./${SCRIPT_NAME} --no-model --no-drawthings
         Install just the services, choose a model later.
-
     ./${SCRIPT_NAME} --update
         Update everything and report how stale the catalogue is.
-
     ./${SCRIPT_NAME} --uninstall
         Guided removal, confirming each step.
-
 HELPTEXT
   exit 0
 }
@@ -634,46 +637,8 @@ HELPTEXT
 # ===========================================================================
 show_status() {
   load_config
-  local ollama webui searxng colima
-
-  if curl -s -o /dev/null http://127.0.0.1:11434/api/version; then
-    ollama="UP"
-  else
-    ollama="DOWN"
-  fi
-
-  if curl -s -o /dev/null "http://127.0.0.1:${WEBUI_PORT}"; then
-    webui="UP"
-  else
-    webui="DOWN"
-  fi
-
-  if curl -s -o /dev/null --max-time 5 "${SEARXNG_URL}/search?q=test&format=json"; then
-    searxng="UP"
-  else
-    searxng="DOWN"
-  fi
-
-  printf '\n'
-  printf 'Ollama      (:11434)   %s\n' "$ollama"
-  printf 'Open WebUI  (:%s)    %s\n' "$WEBUI_PORT" "$webui"
-
-  if [ "$SEARXNG_MODE" = "local" ]; then
-    if command -v colima >/dev/null 2>&1 && colima status >/dev/null 2>&1; then
-      colima="UP"
-    else
-      colima="DOWN"
-    fi
-    printf 'Colima      (runtime)  %s\n' "$colima"
-    printf 'SearXNG     (local)    %s\n' "$searxng"
-    if [ "$colima" = "DOWN" ]; then
-      printf '\nColima needs a console login session. After a reboot with\n'
-      printf 'nobody logged in at the screen, it and SearXNG stay down while\n'
-      printf 'Ollama and Open WebUI come up normally.\n'
-    fi
-  else
-    printf 'SearXNG     (remote)   %s   %s\n' "$searxng" "$SEARXNG_URL"
-  fi
+  eval "$STATUS_BODY"
+  _llmstack_status
   printf '\n'
   exit 0
 }
@@ -684,30 +649,26 @@ show_status() {
 do_update() {
   load_config
   ensure_catalog
-
   local backup_dir="$HOME/.open-webui.backup-$(date +%Y%m%d-%H%M%S)"
-
   log "Backing up Open WebUI data to $backup_dir"
   if [ -d "$DATA_DIR" ]; then
     cp -R "$DATA_DIR" "$backup_dir" || error "Backup failed. Aborting the update."
   else
     warn "No data directory at $DATA_DIR; nothing to back up."
   fi
-
   log "Stopping the stack (sudo required)"
   sudo launchctl bootout "system/${OPENWEBUI_LABEL}" 2>/dev/null || true
   sudo launchctl bootout "system/${OLLAMA_LABEL}" 2>/dev/null || true
   sleep 2
-
   log "Updating Ollama"
-  brew upgrade ollama || echo "Ollama is already at the latest version."
-
+  if ! brew upgrade ollama 2>/dev/null; then
+    log "Ollama is already at the latest version, or brew upgrade failed non-fatally."
+  fi
   log "Updating Open WebUI"
   if ! "$VENV_DIR/bin/pip" install --upgrade open-webui; then
     warn "The Open WebUI update failed. Data is safe at $backup_dir"
     echo "    Restarting the existing version anyway."
   fi
-
   if [ "$SEARXNG_MODE" = "local" ]; then
     log "Updating the SearXNG container image"
     if command -v colima >/dev/null 2>&1 && colima status >/dev/null 2>&1; then
@@ -720,24 +681,18 @@ do_update() {
   else
     log "SearXNG is remote at ${SEARXNG_URL}; update it on that host."
   fi
-
   log "Restarting the stack"
   sudo launchctl bootstrap system "$OLLAMA_PLIST" 2>/dev/null || true
   sudo launchctl bootstrap system "$OPENWEBUI_PLIST" 2>/dev/null || true
-
   log "Waiting for services"
   sleep 20
-
   cat <<UPDATED
-
 ===========================================================================
   UPDATE COMPLETE
 ===========================================================================
   Backup retained at: $backup_dir
 UPDATED
-
   report_catalog_age
-
   detect_system
   local line tag
   line="$(best_for_role daily)"
@@ -749,7 +704,6 @@ UPDATED
     fi
     printf '\n'
   fi
-
   printf 'Run llmstatus to confirm everything is back up.\n'
   printf 'Note that Open WebUI needs 30 to 60 seconds before it answers.\n\n'
   exit 0
@@ -760,26 +714,21 @@ UPDATED
 # ===========================================================================
 uninstall_stack() {
   load_config
-
   cat <<BANNER
-
 ===========================================================================
   LLM STACK UNINSTALLER
 ===========================================================================
   Every artifact this script created is offered for removal one at a
   time. All prompts default to NO, so pressing Enter skips a step.
-
   Never touched:
     Homebrew, python@3.11, mas   shared system dependencies
     Anything you decline below
 ===========================================================================
 BANNER
-
   if ! confirm "Begin uninstall?"; then
     log "Cancelled. Nothing was changed."
     exit 0
   fi
-
   log "Step 1: Stop and unload the LaunchDaemons"
   echo "    Stops Ollama and Open WebUI and removes them from launchd."
   echo "    Reversible: re-run this script without --uninstall."
@@ -791,7 +740,6 @@ BANNER
   else
     warn "Skipped. Later steps may fail while files are still in use."
   fi
-
   log "Step 2: Remove the LaunchDaemon plist files"
   echo "    $OPENWEBUI_PLIST"
   echo "    $OLLAMA_PLIST"
@@ -802,7 +750,6 @@ BANNER
   else
     log "Skipped."
   fi
-
   if [ "$SEARXNG_MODE" = "local" ]; then
     log "Step 3: Remove the SearXNG container"
     if command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx searxng; then
@@ -816,7 +763,6 @@ BANNER
     else
       log "No SearXNG container found."
     fi
-
     log "Step 4: Remove the SearXNG configuration"
     if [ -e "$SEARXNG_DIR" ]; then
       echo "    $SEARXNG_DIR"
@@ -829,7 +775,6 @@ BANNER
     else
       log "No SearXNG configuration."
     fi
-
     log "Step 5: Stop and remove Colima"
     if command -v colima >/dev/null 2>&1; then
       echo "    Stops the Colima virtual machine, deletes it, and uninstalls"
@@ -852,7 +797,6 @@ BANNER
     log "Steps 3 to 5 skipped: SearXNG is remote at ${SEARXNG_URL}"
     echo "    Remove it on that host if you no longer need it."
   fi
-
   log "Step 6: Remove the Open WebUI virtualenv"
   if [ -d "$VENV_DIR" ]; then
     echo "    $VENV_DIR  ($(du -sh "$VENV_DIR" 2>/dev/null | cut -f1))"
@@ -866,7 +810,6 @@ BANNER
   else
     log "No virtualenv."
   fi
-
   log "Step 7: Remove Open WebUI data"
   if [ -d "$DATA_DIR" ]; then
     echo "    $DATA_DIR  ($(du -sh "$DATA_DIR" 2>/dev/null | cut -f1))"
@@ -888,7 +831,6 @@ BANNER
   else
     log "No data directory."
   fi
-
   log "Step 8: Remove downloaded models"
   if [ -d "$OLLAMA_MODELS_DIR" ]; then
     echo "    $OLLAMA_MODELS_DIR"
@@ -904,7 +846,6 @@ BANNER
   else
     log "No model directory."
   fi
-
   log "Step 9: Uninstall the Ollama package"
   if brew list ollama >/dev/null 2>&1; then
     echo "    Removes the ollama binary via Homebrew."
@@ -918,7 +859,6 @@ BANNER
   else
     log "Ollama not installed via Homebrew."
   fi
-
   log "Step 10: Remove the shell commands from .zshrc"
   if [ -f "$ZSHRC" ] && grep -qF "$ALIAS_END_MARKER" "$ZSHRC"; then
     echo "    Removes the marked block, including any left by earlier"
@@ -936,7 +876,6 @@ BANNER
     log "No removable shell block found."
     check_stray_llm_defs
   fi
-
   log "Step 11: Remove configuration and the model catalogue"
   if [ -d "$CONFIG_DIR" ]; then
     echo "    $CONFIG_DIR"
@@ -951,7 +890,6 @@ BANNER
   else
     log "No configuration directory."
   fi
-
   log "Optional: Draw Things"
   if [ -d "$DRAWTHINGS_APP" ]; then
     echo "    $DRAWTHINGS_APP"
@@ -966,16 +904,18 @@ BANNER
   else
     log "Draw Things not installed."
   fi
-
   log "Optional: old data backups"
   local backups
-  backups="$(find "$HOME" -maxdepth 1 -type d -name '.open-webui.backup-*' 2>/dev/null || true)"
+  backups="$(find "$HOME" -maxdepth 1 -type d -name '.open-webui.backup-*' -print0 2>/dev/null \
+    | xargs -0 echo 2>/dev/null || true)"
   if [ -n "$backups" ]; then
-    echo "$backups" | while read -r b; do
-      echo "    $b  ($(du -sh "$b" 2>/dev/null | cut -f1))"
-    done
+    find "$HOME" -maxdepth 1 -type d -name '.open-webui.backup-*' -print0 2>/dev/null \
+      | while IFS= read -r -d '' b; do
+          echo "    $b  ($(du -sh "$b" 2>/dev/null | cut -f1))"
+        done
     if confirm "Delete ALL of the backup directories listed above?"; then
-      echo "$backups" | while read -r b; do rm -rf "$b"; done
+      find "$HOME" -maxdepth 1 -type d -name '.open-webui.backup-*' -print0 2>/dev/null \
+        | while IFS= read -r -d '' b; do rm -rf "$b"; done
       log "Backups removed."
     else
       log "Skipped."
@@ -983,21 +923,17 @@ BANNER
   else
     log "No backup directories found."
   fi
-
   cat <<SUMMARY
-
 ===========================================================================
   UNINSTALL COMPLETE
 ===========================================================================
   Left in place by design:
     Homebrew, python@3.11, mas   shared dependencies
     Anything you answered N to
-
   Check what is still running:
     pgrep -lf open-webui
     pgrep -lf "ollama serve"
 ===========================================================================
-
 SUMMARY
   exit 0
 }
@@ -1024,10 +960,10 @@ start_searxng_container() {
 # ARGUMENT PARSING
 # ===========================================================================
 MODE="install"
-
 while [ $# -gt 0 ]; do
   case "$1" in
     --help|-h)      show_help ;;
+    --version)     echo "${SCRIPT_NAME} v${SCRIPT_VERSION}"; exit 0 ;;
     --install)      MODE="install" ;;
     --update|--upgrade) MODE="update" ;;
     --status)       MODE="status" ;;
@@ -1040,11 +976,13 @@ while [ $# -gt 0 ]; do
       shift ;;
     --searxng-port)
       [ $# -ge 2 ] || error "--searxng-port needs a port number"
+      validate_port "$2"
       SEARXNG_HOST_PORT="$2"
       SEARXNG_URL="http://127.0.0.1:${SEARXNG_HOST_PORT}"
       shift ;;
     --webui-port)
       [ $# -ge 2 ] || error "--webui-port needs a port number"
+      validate_port "$2"
       WEBUI_PORT="$2"
       shift ;;
     --model)
@@ -1068,9 +1006,9 @@ esac
 # ===========================================================================
 # INSTALL
 # ===========================================================================
+INSTALL_STARTED="yes"
 
 log "Preflight"
-
 [ "$(uname -s)" = "Darwin" ] || error "This script targets macOS. Detected: $(uname -s)"
 [ "$(uname -m)" = "arm64" ]  || error "This script targets Apple Silicon (arm64). Detected: $(uname -m)"
 
@@ -1084,7 +1022,6 @@ detect_system
 ensure_catalog
 
 cat <<DETECTED
-
 ===========================================================================
   DETECTED SYSTEM
 ===========================================================================
@@ -1093,16 +1030,26 @@ cat <<DETECTED
   Unified memory:    ${SYS_RAM_GB} GB
   Usable for models: ~${SYS_USABLE_GB} GB
   Free disk:         ${SYS_DISK_FREE_GB} GB
-
   $(bandwidth_note)
 ===========================================================================
 DETECTED
+
+# --- port conflict check ---------------------------------------------------
+if port_in_use "$WEBUI_PORT"; then
+  warn "Port ${WEBUI_PORT} is already in use."
+  echo "    Another process is listening on :${WEBUI_PORT}. Open WebUI will fail."
+  echo "    Free the port, or re-run with --webui-port <other-port>."
+fi
+if [ "$SEARXNG_MODE" = "local" ] && port_in_use "$SEARXNG_HOST_PORT"; then
+  warn "Port ${SEARXNG_HOST_PORT} is already in use."
+  echo "    Another process is listening on :${SEARXNG_HOST_PORT}. SearXNG will fail."
+  echo "    Free the port, or re-run with --searxng-port <other-port>."
+fi
 
 # --- choose a model --------------------------------------------------------
 MODEL_TAG=""
 MODEL_SIZE=0
 MODEL_VERIFIED="yes"
-
 if [ "$SKIP_MODEL" = "yes" ]; then
   log "Skipping the model download (--no-model)."
 elif [ -n "$FORCE_MODEL" ]; then
@@ -1113,8 +1060,6 @@ elif [ -n "$FORCE_MODEL" ]; then
 else
   REC_LINE="$(best_for_role daily)"
   if [ -z "$REC_LINE" ]; then
-    # Nothing in the daily tier fits. Fall back to the light tier rather
-    # than leaving a low-memory machine with no model at all.
     REC_LINE="$(best_for_role light)"
     [ -n "$REC_LINE" ] && log "No daily-tier model fits; falling back to a lighter one."
   fi
@@ -1130,13 +1075,11 @@ else
     printf '\nRecommended model: %s  (%s GB, %s)\n' \
       "$MODEL_TAG" "$MODEL_SIZE" "$(field "$REC_LINE" 4)"
     printf '  %s\n' "$(field "$REC_LINE" 7)"
-
     if [ "$MODEL_VERIFIED" != "yes" ]; then
       printf '\n  This tag is marked UNVERIFIED in the catalogue. It may no\n'
       printf '  longer exist. If the pull fails, check\n'
       printf '  https://ollama.com/library and correct %s\n' "$CATALOG"
     fi
-
     if [ "$SYS_DISK_FREE_GB" -lt $(( MODEL_SIZE + 10 )) ]; then
       warn "Only ${SYS_DISK_FREE_GB} GB free; about $(( MODEL_SIZE + 10 )) GB is wanted."
       echo "    Free some space, or re-run with --no-model."
@@ -1167,7 +1110,7 @@ if ! brew list ollama >/dev/null 2>&1; then
   brew install ollama
 else
   log "Ollama present; checking for updates"
-  brew upgrade ollama || echo "Already at the latest version."
+  brew upgrade ollama 2>/dev/null || log "Already at the latest version."
 fi
 
 # --- Python ----------------------------------------------------------------
@@ -1187,21 +1130,18 @@ if [ "$SEARXNG_MODE" = "local" ]; then
     echo "    Log in at the screen and re-run to finish the SearXNG setup,"
     echo "    or use --searxng-url to point at a remote instance instead."
   fi
-
   if ! brew list colima >/dev/null 2>&1; then
     log "Installing Colima"
     brew install colima
   else
     log "Colima present."
   fi
-
   if ! brew list docker >/dev/null 2>&1; then
     log "Installing the docker CLI"
     brew install docker
   else
     log "docker CLI present."
   fi
-
   if colima status >/dev/null 2>&1; then
     log "Colima already running."
   else
@@ -1233,7 +1173,6 @@ if [ ! -d "$VENV_DIR" ]; then
 else
   log "Virtualenv present."
 fi
-
 log "Installing or upgrading Open WebUI. This is large and may take several minutes."
 "$VENV_DIR/bin/pip" install --upgrade pip >/dev/null 2>&1
 "$VENV_DIR/bin/pip" install --upgrade open-webui
@@ -1242,37 +1181,30 @@ log "Installing or upgrading Open WebUI. This is large and may take several minu
 mkdir -p "$CONFIG_DIR"
 if [ ! -f "$SECRET_FILE" ]; then
   log "Generating a persistent secret key"
-  python3 -c "import secrets; print(secrets.token_hex(16))" > "$SECRET_FILE"
+  "$PYTHON_BIN" -c "import secrets; print(secrets.token_hex(16))" > "$SECRET_FILE"
   chmod 600 "$SECRET_FILE"
 else
   log "Reusing the existing secret key."
 fi
 WEBUI_SECRET_KEY="$(cat "$SECRET_FILE")"
-
 mkdir -p "$DATA_DIR" "$HOME/.ollama"
 
 # --- SearXNG, local mode ---------------------------------------------------
 if [ "$SEARXNG_MODE" = "local" ]; then
   mkdir -p "$SEARXNG_DIR"
-
-  # Docker creates a DIRECTORY at a bind-mount path when the file is absent.
-  # Clear that first so the real settings file can be written.
   if [ -d "$SEARXNG_SETTINGS" ]; then
     log "Removing a stale settings.yml directory left behind by Docker"
     rmdir "$SEARXNG_SETTINGS" 2>/dev/null || rm -rf "$SEARXNG_SETTINGS"
   fi
-
   if [ ! -f "$SEARXNG_SETTINGS" ]; then
     log "Writing the SearXNG configuration"
-    SEARXNG_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+    SEARXNG_SECRET="$("$PYTHON_BIN" -c 'import secrets; print(secrets.token_hex(16))')"
     cat > "$SEARXNG_SETTINGS" <<SEARXNG_YML
 use_default_settings: true
-
 server:
   secret_key: "${SEARXNG_SECRET}"
   limiter: false
   image_proxy: true
-
 search:
   formats:
     - html
@@ -1281,7 +1213,6 @@ SEARXNG_YML
   else
     log "SearXNG configuration already present; keeping it."
   fi
-
   if colima status >/dev/null 2>&1; then
     if docker ps -a --format '{{.Names}}' | grep -qx searxng; then
       log "SearXNG container exists."
@@ -1290,11 +1221,10 @@ SEARXNG_YML
       log "Creating the SearXNG container"
       start_searxng_container
     fi
-
     log "Waiting for SearXNG on :${SEARXNG_HOST_PORT}"
     for i in $(seq 1 30); do
-      if curl -s "http://127.0.0.1:${SEARXNG_HOST_PORT}/search?q=test&format=json" >/dev/null 2>&1; then
-        log "SearXNG is answering."
+      if curl -s --max-time 3 "http://127.0.0.1:${SEARXNG_HOST_PORT}/search?q=test&format=json" >/dev/null 2>&1; then
+        ok "SearXNG is answering."
         break
       fi
       sleep 2
@@ -1341,7 +1271,8 @@ sudo tee "$OLLAMA_PLIST" > /dev/null <<PLIST_OLLAMA
 </dict>
 </plist>
 PLIST_OLLAMA
-
+sudo chown root:wheel "$OLLAMA_PLIST"
+sudo chmod 644 "$OLLAMA_PLIST"
 plutil -lint "$OLLAMA_PLIST" >/dev/null || error "The generated Ollama plist is malformed."
 
 log "Loading the Ollama daemon"
@@ -1401,7 +1332,8 @@ sudo tee "$OPENWEBUI_PLIST" > /dev/null <<PLIST_WEBUI
 </dict>
 </plist>
 PLIST_WEBUI
-
+sudo chown root:wheel "$OPENWEBUI_PLIST"
+sudo chmod 644 "$OPENWEBUI_PLIST"
 plutil -lint "$OPENWEBUI_PLIST" >/dev/null || error "The generated Open WebUI plist is malformed."
 
 log "Loading the Open WebUI daemon"
@@ -1433,16 +1365,17 @@ fi
 if [ "$SKIP_MODEL" != "yes" ] && [ -n "$MODEL_TAG" ]; then
   log "Waiting for the Ollama API on :11434"
   for i in $(seq 1 30); do
-    if curl -s http://127.0.0.1:11434/api/version >/dev/null; then break; fi
+    if curl -s --max-time 2 http://127.0.0.1:11434/api/version >/dev/null; then break; fi
     sleep 1
     [ "$i" -eq 30 ] && error "The Ollama API did not respond after 30 seconds."
   done
-
   if ollama list | awk '{print $1}' | grep -qx "$MODEL_TAG"; then
     log "Model already present: $MODEL_TAG"
   else
     log "Pulling $MODEL_TAG. This is a large download and will take a while."
+    trap 'warn "Pull interrupted. Re-run to resume the download."; exit 1' INT
     if ! ollama pull "$MODEL_TAG"; then
+      trap - INT
       warn "The pull failed for $MODEL_TAG"
       echo "    The tag may have changed or may never have existed."
       echo "    Browse current tags at https://ollama.com/library, then edit"
@@ -1450,6 +1383,9 @@ if [ "$SKIP_MODEL" != "yes" ] && [ -n "$MODEL_TAG" ]; then
       echo "      ollama pull MODEL_TAG"
       echo ""
       echo "    Everything else installed correctly."
+    else
+      trap - INT
+      ok "Model pulled: $MODEL_TAG"
     fi
   fi
 fi
@@ -1477,15 +1413,8 @@ else
     printf '# Installed by llmstack-macos.sh. Settings live in\n'
     printf '# ~/.config/llmstack/config and are read at call time.\n'
     printf 'LLMSTACK_SCRIPT="%s"\n' "$SCRIPT_ABS"
+    printf '%s\n' "$STATUS_BODY"
     cat <<'ZSH_BODY'
-
-_llmstack_conf() {
-  SEARXNG_MODE="local"
-  SEARXNG_URL="http://127.0.0.1:8888"
-  WEBUI_PORT="8080"
-  [ -f "$HOME/.config/llmstack/config" ] && . "$HOME/.config/llmstack/config"
-}
-
 llmstop() {
   _llmstack_conf
   sudo launchctl bootout system/com.local.openwebui 2>/dev/null
@@ -1496,7 +1425,6 @@ llmstop() {
   fi
   echo "LLM stack stopped."
 }
-
 llmstart() {
   _llmstack_conf
   if [ "$SEARXNG_MODE" = "local" ]; then
@@ -1511,40 +1439,7 @@ llmstart() {
   sudo launchctl bootstrap system /Library/LaunchDaemons/com.local.openwebui.plist 2>/dev/null
   echo "LLM stack started. Open WebUI needs 30 to 60 seconds before it answers."
 }
-
-llmstatus() {
-  _llmstack_conf
-  local ollama webui searxng colima
-  if curl -s -o /dev/null http://127.0.0.1:11434/api/version; then
-    ollama="UP"
-  else
-    ollama="DOWN"
-  fi
-  if curl -s -o /dev/null "http://127.0.0.1:${WEBUI_PORT}"; then
-    webui="UP"
-  else
-    webui="DOWN"
-  fi
-  if curl -s -o /dev/null --max-time 5 "${SEARXNG_URL}/search?q=test&format=json"; then
-    searxng="UP"
-  else
-    searxng="DOWN"
-  fi
-  printf 'Ollama      (:11434)   %s\n' "$ollama"
-  printf 'Open WebUI  (:%s)    %s\n' "$WEBUI_PORT" "$webui"
-  if [ "$SEARXNG_MODE" = "local" ]; then
-    if colima status >/dev/null 2>&1; then colima="UP"; else colima="DOWN"; fi
-    printf 'Colima      (runtime)  %s\n' "$colima"
-    printf 'SearXNG     (local)    %s\n' "$searxng"
-    if [ "$colima" = "DOWN" ]; then
-      printf '\nColima needs a console login session. After a reboot with\n'
-      printf 'nobody logged in at the screen, it and SearXNG stay down.\n'
-    fi
-  else
-    printf 'SearXNG     (remote)   %s   %s\n' "$searxng" "$SEARXNG_URL"
-  fi
-}
-
+llmstatus() { _llmstack_status; }
 llmupgrade() {
   if [ -x "$LLMSTACK_SCRIPT" ]; then
     "$LLMSTACK_SCRIPT" --update
@@ -1561,51 +1456,47 @@ fi
 
 # --- verify ----------------------------------------------------------------
 log "Verifying services"
-curl -s -o /dev/null -w "Ollama:     %{http_code}\n" http://127.0.0.1:11434/api/version || true
-
+curl -s -o /dev/null --max-time 5 -w "Ollama:     %{http_code}\n" http://127.0.0.1:11434/api/version || true
 log "Waiting for Open WebUI on :${WEBUI_PORT}. First start takes 30 to 60 seconds."
 for i in $(seq 1 45); do
-  if curl -s -o /dev/null "http://127.0.0.1:${WEBUI_PORT}"; then
-    echo "Open WebUI: 200"
+  if curl -s -o /dev/null --max-time 3 "http://127.0.0.1:${WEBUI_PORT}"; then
+    ok "Open WebUI: 200"
     break
   fi
   sleep 2
   [ "$i" -eq 45 ] && warn "Not answering yet. Check ${DATA_DIR}/openwebui.err.log"
 done
 
-cat <<DONE
+# Clear the error trap — we're done.
+trap - EXIT
+INSTALL_STARTED="no"
 
+cat <<DONE
 ===========================================================================
   SETUP COMPLETE
 ===========================================================================
   Ollama API:   http://127.0.0.1:11434
   Open WebUI:   http://$(hostname).local:${WEBUI_PORT}
   SearXNG:      ${SEARXNG_URL}
-
   Next steps:
     1. exec zsh
        Loads llmstatus, llmstart, llmstop and llmupgrade.
        Use exec zsh, not 'source ~/.zshrc'. Sourcing cannot clear
        definitions already present in a running shell, and an alias
        left over from an older install will break the new functions.
-
     2. Open the Open WebUI address above and create the admin account.
        The first account created becomes the owner, so do this before
        anyone else on the network can.
-
     3. Turn on web search:
          Admin, Settings, Web Search
            Enable:      ON
            Engine:      searxng
            SearXNG URL: ${SEARXNG_URL}
        The URL field only appears once the engine is selected.
-
   Model catalogue: ${CATALOG}
     Edit it to change what this script recommends. Bump its
     Last-Updated line when you do; --update reports how old it is.
-
   Documentation:  ./${SCRIPT_NAME} --help
   Uninstall:      ./${SCRIPT_NAME} --uninstall
 ===========================================================================
-
 DONE
