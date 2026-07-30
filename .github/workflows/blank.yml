@@ -1,0 +1,431 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ===========================================================================
+  # Lint — fast, runs on every push and PR
+  # ===========================================================================
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Syntax check (bash -n)
+        run: bash -n llmstack-macos.sh
+
+      - name: Shellcheck
+        run: shellcheck -x llmstack-macos.sh
+
+      - name: No executable stack
+        run: |
+          # The script has no shebang for sh; confirm it's bash-only
+          head -1 llmstack-macos.sh | grep -q '^#!/bin/bash' \
+            || { echo "FAIL: shebang is not #!/bin/bash"; exit 1; }
+
+  # ===========================================================================
+  # CLI Tests — runs on Ubuntu; tests argument handling, output, catalogue
+  # ===========================================================================
+  test:
+    name: CLI Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make executable
+        run: chmod +x llmstack-macos.sh
+
+      # ---------------------------------------------------------------------
+      # Help and version
+      # ---------------------------------------------------------------------
+      - name: '--help exits 0'
+        run: ./llmstack-macos.sh --help
+
+      - name: '-h exits 0'
+        run: ./llmstack-macos.sh -h
+
+      - name: '--help mentions all modes'
+        run: |
+          output=$(./llmstack-macos.sh --help)
+          for mode in --install --update --status --recommend --uninstall --version --help; do
+            echo "$output" | grep -q -- "$mode" \
+              || { echo "FAIL: --help does not mention $mode"; exit 1; }
+          done
+
+      - name: '--version exits 0 and prints version'
+        run: |
+          output=$(./llmstack-macos.sh --version)
+          echo "$output"
+          echo "$output" | grep -qE 'v[0-9]+\.[0-9]+' \
+            || { echo "FAIL: no version number found"; exit 1; }
+
+      # ---------------------------------------------------------------------
+      # Argument validation — commands expected to fail
+      # ---------------------------------------------------------------------
+      - name: 'Unknown argument exits 1'
+        run: |
+          set +e
+          ./llmstack-macos.sh --bogus-arg 2>/dev/null
+          rc=$?
+          [ "$rc" -eq 1 ] || { echo "FAIL: expected exit 1, got $rc"; exit 1; }
+
+      - name: 'Invalid port (non-numeric) exits 1'
+        run: |
+          set +e
+          ./llmstack-macos.sh --webui-port abc 2>/dev/null
+          rc=$?
+          [ "$rc" -eq 1 ] || { echo "FAIL: expected exit 1, got $rc"; exit 1; }
+
+      - name: 'Invalid port (out of range high) exits 1'
+        run: |
+          set +e
+          ./llmstack-macos.sh --webui-port 99999 2>/dev/null
+          rc=$?
+          [ "$rc" -eq 1 ] || { echo "FAIL: expected exit 1, got $rc"; exit 1; }
+
+      - name: 'Invalid port (zero) exits 1'
+        run: |
+          set +e
+          ./llmstack-macos.sh --searxng-port 0 2>/dev/null
+          rc=$?
+          [ "$rc" -eq 1 ] || { echo "FAIL: expected exit 1, got $rc"; exit 1; }
+
+      - name: 'Invalid port (negative) exits 1'
+        run: |
+          set +e
+          ./llmstack-macos.sh --webui-port -1 2>/dev/null
+          rc=$?
+          [ "$rc" -eq 1 ] || { echo "FAIL: expected exit 1, got $rc"; exit 1; }
+
+      - name: 'Missing value for --searxng-url exits 1'
+        run: |
+          set +e
+          ./llmstack-macos.sh --searxng-url 2>/dev/null
+          rc=$?
+          [ "$rc" -eq 1 ] || { echo "FAIL: expected exit 1, got $rc"; exit 1; }
+
+      - name: 'Missing value for --model exits 1'
+        run: |
+          set +e
+          ./llmstack-macos.sh --model 2>/dev/null
+          rc=$?
+          [ "$rc" -eq 1 ] || { echo "FAIL: expected exit 1, got $rc"; exit 1; }
+
+      - name: 'Missing value for --webui-port exits 1'
+        run: |
+          set +e
+          ./llmstack-macos.sh --webui-port 2>/dev/null
+          rc=$?
+          [ "$rc" -eq 1 ] || { echo "FAIL: expected exit 1, got $rc"; exit 1; }
+
+      - name: 'Missing value for --searxng-port exits 1'
+        run: |
+          set +e
+          ./llmstack-macos.sh --searxng-port 2>/dev/null
+          rc=$?
+          [ "$rc" -eq 1 ] || { echo "FAIL: expected exit 1, got $rc"; exit 1; }
+
+      # ---------------------------------------------------------------------
+      # --recommend
+      # ---------------------------------------------------------------------
+      - name: '--recommend produces hardware report'
+        run: |
+          output=$(./llmstack-macos.sh --recommend 2>&1)
+          echo "$output"
+          echo "$output" | grep -q "DETECTED SYSTEM" \
+            || { echo "FAIL: no DETECTED SYSTEM header"; exit 1; }
+
+      - name: '--recommend writes the catalogue file'
+        run: |
+          [ -f "$HOME/.config/llmstack/models.catalog" ] \
+            || { echo "FAIL: catalogue not written"; exit 1; }
+
+      - name: '--recommend shows catalogue staleness info'
+        run: |
+          output=$(./llmstack-macos.sh --recommend 2>&1)
+          echo "$output" | grep -qi "catalogue" \
+            || { echo "FAIL: no catalogue mention"; exit 1; }
+
+      - name: '--recommend does not overwrite existing catalogue'
+        run: |
+          # Corrupt the date line, re-run, confirm it's preserved
+          sed -i 's/^# Last-Updated:.*/# Last-Updated: 1999-01-01/' \
+            "$HOME/.config/llmstack/models.catalog"
+          output=$(./llmstack-macos.sh --recommend 2>&1)
+          grep -q '^# Last-Updated: 1999-01-01' \
+            "$HOME/.config/llmstack/models.catalog" \
+            || { echo "FAIL: catalogue was overwritten"; exit 1; }
+          echo "Catalogue preserved across runs"
+
+      # ---------------------------------------------------------------------
+      # --status
+      # ---------------------------------------------------------------------
+      - name: '--status reports component health'
+        run: |
+          output=$(./llmstack-macos.sh --status 2>&1)
+          echo "$output"
+          echo "$output" | grep -q "Ollama" \
+            || { echo "FAIL: no Ollama line"; exit 1; }
+          echo "$output" | grep -q "Open WebUI" \
+            || { echo "FAIL: no Open WebUI line"; exit 1; }
+          echo "$output" | grep -q "SearXNG" \
+            || { echo "FAIL: no SearXNG line"; exit 1; }
+
+      # ---------------------------------------------------------------------
+      # Catalogue format validation
+      # ---------------------------------------------------------------------
+      - name: 'Catalogue has Last-Updated date'
+        run: |
+          grep -q '^# Last-Updated:' "$HOME/.config/llmstack/models.catalog" \
+            || { echo "FAIL: no Last-Updated line"; exit 1; }
+
+      - name: 'Catalogue data lines have 7 pipe-delimited fields'
+        run: |
+          grep -v '^#' "$HOME/.config/llmstack/models.catalog" \
+            | grep -v '^$' \
+            | awk -F'|' '{
+                if (NF != 7) {
+                  printf "FAIL: line has %d fields (expected 7): %s\n", NF, $0
+                  exit 1
+                }
+              }'
+          echo "All data lines have 7 fields"
+
+      - name: 'Catalogue tags match ollama name[:tag] format'
+        run: |
+          grep -v '^#' "$HOME/.config/llmstack/models.catalog" \
+            | grep -v '^$' \
+            | awk -F'|' '{
+                gsub(/^[ \t]+|[ \t]+$/, "", $2)
+                if ($2 !~ /^[a-zA-Z0-9._:-]+$/) {
+                  printf "FAIL: invalid tag format: %s\n", $2
+                  exit 1
+                }
+              }'
+          echo "All tags match expected format"
+
+      - name: 'Catalogue VERIFIED column is yes or no'
+        run: |
+          grep -v '^#' "$HOME/.config/llmstack/models.catalog" \
+            | grep -v '^$' \
+            | awk -F'|' '{
+                gsub(/^[ \t]+|[ \t]+$/, "", $6)
+                if ($6 != "yes" && $6 != "no") {
+                  printf "FAIL: VERIFIED column is '%s' (expected yes or no)\n", $6
+                  exit 1
+                }
+              }'
+          echo "VERIFIED column OK"
+
+      - name: 'Catalogue ARCH column is moe or dense'
+        run: |
+          grep -v '^#' "$HOME/.config/llmstack/models.catalog" \
+            | grep -v '^$' \
+            | awk -F'|' '{
+                gsub(/^[ \t]+|[ \t]+$/, "", $4)
+                if ($4 != "moe" && $4 != "dense") {
+                  printf "FAIL: ARCH column is '%s' (expected moe or dense)\n", $4
+                  exit 1
+                }
+              }'
+          echo "ARCH column OK"
+
+      - name: 'Catalogue ROLE column uses known values'
+        run: |
+          grep -v '^#' "$HOME/.config/llmstack/models.catalog" \
+            | grep -v '^$' \
+            | awk -F'|' '{
+                gsub(/^[ \t]+|[ \t]+$/, "", $5)
+                if ($5 !~ /^(daily|coding|vision|light)$/) {
+                  printf "FAIL: ROLE column is '%s'\n", $5
+                  exit 1
+                }
+              }'
+          echo "ROLE column OK"
+
+      - name: 'Catalogue has at least one verified daily driver'
+        run: |
+          grep -v '^#' "$HOME/.config/llmstack/models.catalog" \
+            | grep -v '^$' \
+            | awk -F'|' '
+                { gsub(/^[ \t]+|[ \t]+$/, "", $5); gsub(/^[ \t]+|[ \t]+$/, "", $6) }
+                $5 == "daily" && $6 == "yes" { found=1 }
+                END { if (!found) { print "FAIL: no verified daily driver"; exit 1 } }
+              '
+          echo "At least one verified daily driver present"
+
+      # ---------------------------------------------------------------------
+      # Regression: fictional tags must not reappear
+      # ---------------------------------------------------------------------
+      - name: 'No fictional model tags in script'
+        run: |
+          if grep -qE 'qwen3\.6:35b-a3b|gemma4:26b-a4b|llama3\.3:70b' llmstack-macos.sh; then
+            echo "FAIL: found a known-fictional model tag in the script"
+            grep -nE 'qwen3\.6:35b-a3b|gemma4:26b-a4b|llama3\.3:70b' llmstack-macos.sh
+            exit 1
+          fi
+          echo "No fictional tags found"
+
+      - name: 'No fictional model tags in generated catalogue'
+        run: |
+          if grep -qE 'qwen3\.6:35b-a3b|gemma4:26b-a4b|llama3\.3:70b' \
+            "$HOME/.config/llmstack/models.catalog"; then
+            echo "FAIL: found a known-fictional model tag in the catalogue"
+            exit 1
+          fi
+          echo "No fictional tags in catalogue"
+
+      # ---------------------------------------------------------------------
+      # Idempotency
+      # ---------------------------------------------------------------------
+      - name: '--recommend is idempotent (run twice, same output)'
+        run: |
+          out1=$(./llmstack-macos.sh --recommend 2>&1)
+          out2=$(./llmstack-macos.sh --recommend 2>&1)
+          [ "$out1" = "$out2" ] \
+            || { echo "FAIL: --recommend produced different output on second run"; exit 1; }
+          echo "Idempotent"
+
+  # ===========================================================================
+  # macOS Tests — runs on Apple Silicon; tests real hardware detection
+  # Conditional to conserve macOS runner minutes (10x billing rate)
+  # ===========================================================================
+  test-macos:
+    name: macOS Tests
+    runs-on: macos-latest
+    timeout-minutes: 10
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make executable
+        run: chmod +x llmstack-macos.sh
+
+      - name: Syntax check
+        run: bash -n llmstack-macos.sh
+
+      - name: Shellcheck (brew)
+        run: |
+          brew install shellcheck
+          shellcheck -x llmstack-macos.sh
+
+      - name: '--recommend detects real Apple Silicon hardware'
+        run: |
+          output=$(./llmstack-macos.sh --recommend 2>&1)
+          echo "$output"
+          echo "$output" | grep -q "DETECTED SYSTEM" \
+            || { echo "FAIL: no DETECTED SYSTEM header"; exit 1; }
+          # Chip should not be "unknown" on real Apple Silicon
+          echo "$output" | grep -q "Chip:.*unknown" \
+            && { echo "FAIL: chip detected as unknown on Apple Silicon"; exit 1; } \
+            || echo "Chip detected correctly"
+
+      - name: '--recommend shows non-zero memory'
+        run: |
+          output=$(./llmstack-macos.sh --recommend 2>&1)
+          mem_line=$(echo "$output" | grep "Unified memory:")
+          echo "$mem_line"
+          mem=$(echo "$mem_line" | grep -oE '[0-9]+' | head -1)
+          [ -n "$mem" ] && [ "$mem" -gt 0 ] \
+            || { echo "FAIL: memory not detected or zero"; exit 1; }
+          echo "Memory detected: ${mem} GB"
+
+      - name: '--recommend shows non-zero disk space'
+        run: |
+          output=$(./llmstack-macos.sh --recommend 2>&1)
+          disk_line=$(echo "$output" | grep "Free disk:")
+          echo "$disk_line"
+          disk=$(echo "$disk_line" | grep -oE '[0-9]+' | head -1)
+          [ -n "$disk" ] && [ "$disk" -gt 0 ] \
+            || { echo "FAIL: disk space not detected or zero"; exit 1; }
+          echo "Free disk: ${disk} GB"
+
+      - name: '--recommend assigns a chip tier'
+        run: |
+          output=$(./llmstack-macos.sh --recommend 2>&1)
+          tier_line=$(echo "$output" | grep "Tier:")
+          echo "$tier_line"
+          echo "$tier_line" | grep -qE 'Tier:\s+(Ultra|Max|Pro|Base)' \
+            || { echo "FAIL: no valid chip tier assigned"; exit 1; }
+
+      - name: '--recommend shows bandwidth note for detected tier'
+        run: |
+          output=$(./llmstack-macos.sh --recommend 2>&1)
+          # The bandwidth_note line should mention "tier"
+          echo "$output" | grep -qi "tier" \
+            || { echo "FAIL: no bandwidth note"; exit 1; }
+
+      - name: '--recommend recommends at least one model'
+        run: |
+          output=$(./llmstack-macos.sh --recommend 2>&1)
+          # macOS runners have enough memory for at least one model
+          echo "$output" | grep -qE '(daily|coding|vision|light):' \
+            || { echo "FAIL: no model recommended"; exit 1; }
+          echo "At least one model recommended"
+
+      - name: '--status shows all components'
+        run: |
+          output=$(./llmstack-macos.sh --status 2>&1)
+          echo "$output"
+          echo "$output" | grep -q "Ollama" \
+            || { echo "FAIL: no Ollama line"; exit 1; }
+          echo "$output" | grep -q "Open WebUI" \
+            || { echo "FAIL: no Open WebUI line"; exit 1; }
+          echo "$output" | grep -q "SearXNG" \
+            || { echo "FAIL: no SearXNG line"; exit 1; }
+
+      - name: 'Catalogue written and valid on macOS'
+        run: |
+          [ -f "$HOME/.config/llmstack/models.catalog" ] \
+            || { echo "FAIL: catalogue not written"; exit 1; }
+          grep -v '^#' "$HOME/.config/llmstack/models.catalog" \
+            | grep -v '^$' \
+            | awk -F'|' '{ if (NF != 7) { printf "FAIL: %d fields: %s\n", NF, $0; exit 1 } }'
+          echo "Catalogue valid"
+
+      - name: 'No fictional tags in macOS-generated catalogue'
+        run: |
+          if grep -qE 'qwen3\.6:35b-a3b|gemma4:26b-a4b|llama3\.3:70b' \
+            "$HOME/.config/llmstack/models.catalog"; then
+            echo "FAIL: fictional tag in catalogue"
+            exit 1
+          fi
+          echo "No fictional tags"
+
+  # ===========================================================================
+  # Summary job — useful for branch protection rules
+  # ===========================================================================
+  ci-pass:
+    name: CI Pass
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    if: always()
+    steps:
+      - name: Check job results
+        run: |
+          lint="${{ needs.lint.result }}"
+          test="${{ needs.test.result }}"
+          echo "Lint: $lint"
+          echo "Test: $test"
+          [ "$lint" = "success" ] && [ "$test" = "success" ] \
+            || { echo "FAIL: one or more jobs failed"; exit 1; }
+          echo "All required jobs passed"
