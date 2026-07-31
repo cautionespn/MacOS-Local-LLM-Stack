@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# llmstack-macos.sh  v3.1.2
+# llmstack-macos.sh  v3.1.3
 #
 # A self-contained, private LLM stack for macOS on Apple Silicon.
 #
@@ -22,7 +22,7 @@ set -euo pipefail
 # Constants
 # ---------------------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="3.1.2"
+SCRIPT_VERSION="3.1.3"
 CATALOG_DATE="2025-01-15"
 CATALOG_WARN_DAYS=90
 CATALOG_STALE_DAYS=180
@@ -149,7 +149,8 @@ ZSHRC_BACKED_UP="no"
 backup_zshrc() {
   [ -f "$ZSHRC" ] || return 0
   [ "$ZSHRC_BACKED_UP" = "yes" ] && return 0
-  local dest="${ZSHRC}.backup-$(date +%Y%m%d-%H%M%S)"
+  local dest
+  dest="${ZSHRC}.backup-$(date +%Y%m%d-%H%M%S)"
   cp "$ZSHRC" "$dest"
   ZSHRC_BACKED_UP="yes"
   log "Backed up .zshrc to $dest"
@@ -428,20 +429,22 @@ _llmstack_status() {
 show_recommendations() {
   detect_system
   ensure_catalog
-  cat <<SYSINFO
+  cat <<'SYSINFO'
 ===========================================================================
   DETECTED SYSTEM
 ===========================================================================
-  Chip:              ${SYS_CHIP}
-  Tier:              ${SYS_TIER}
-  CPU cores:         ${SYS_CORES}
-  Unified memory:    ${SYS_RAM_GB} GB
-  Usable for models: ~${SYS_USABLE_GB} GB  (about 70 percent)
-  Free disk:         ${SYS_DISK_FREE_GB} GB
-  $(bandwidth_note)
+SYSINFO
+  printf '  Chip:              %s\n' "$SYS_CHIP"
+  printf '  Tier:              %s\n' "$SYS_TIER"
+  printf '  CPU cores:         %s\n' "$SYS_CORES"
+  printf '  Unified memory:    %s GB\n' "$SYS_RAM_GB"
+  printf '  Usable for models: ~%s GB  (about 70 percent)\n' "$SYS_USABLE_GB"
+  printf '  Free disk:         %s GB\n' "$SYS_DISK_FREE_GB"
+  printf '  %s\n' "$(bandwidth_note)"
+  cat <<'SYSINFO2'
 ===========================================================================
 RECOMMENDED MODELS
-SYSINFO
+SYSINFO2
   local role line tag size arch verified notes found
   found="no"
   for role in daily coding vision light; do
@@ -667,7 +670,8 @@ show_status() {
 do_update() {
   load_config
   ensure_catalog
-  local backup_dir="$HOME/.open-webui.backup-$(date +%Y%m%d-%H%M%S)"
+  local backup_dir
+  backup_dir="$HOME/.open-webui.backup-$(date +%Y%m%d-%H%M%S)"
   log "Backing up Open WebUI data to $backup_dir"
   if [ -d "$DATA_DIR" ]; then
     cp -R "$DATA_DIR" "$backup_dir" || error "Backup failed. Aborting the update."
@@ -1047,18 +1051,20 @@ fi
 detect_system
 ensure_catalog
 
-cat <<DETECTED
+cat <<'DETECTED_HDR'
 ===========================================================================
   DETECTED SYSTEM
 ===========================================================================
-  Chip:              ${SYS_CHIP}
-  Tier:              ${SYS_TIER}
-  Unified memory:    ${SYS_RAM_GB} GB
-  Usable for models: ~${SYS_USABLE_GB} GB
-  Free disk:         ${SYS_DISK_FREE_GB} GB
-  $(bandwidth_note)
+DETECTED_HDR
+printf '  Chip:              %s\n' "$SYS_CHIP"
+printf '  Tier:              %s\n' "$SYS_TIER"
+printf '  Unified memory:    %s GB\n' "$SYS_RAM_GB"
+printf '  Usable for models: ~%s GB\n' "$SYS_USABLE_GB"
+printf '  Free disk:         %s GB\n' "$SYS_DISK_FREE_GB"
+printf '  %s\n' "$(bandwidth_note)"
+cat <<'DETECTED_FTR'
 ===========================================================================
-DETECTED
+DETECTED_FTR
 
 # --- port conflict check ---------------------------------------------------
 # NOTE: 'holder' is intentionally NOT declared local — this is the main
@@ -1130,6 +1136,7 @@ if ! command -v brew >/dev/null 2>&1; then
   eval "$(/opt/homebrew/bin/brew shellenv)"
   if ! grep -q 'brew shellenv' "$ZSHRC" 2>/dev/null; then
     log "Adding Homebrew to the PATH in .zshrc"
+    # shellcheck disable=SC2016
     echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> "$ZSHRC"
   fi
 else
