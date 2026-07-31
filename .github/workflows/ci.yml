@@ -283,19 +283,21 @@ jobs:
 
       # ---------------------------------------------------------------------
       # Regression: fictional tags must not reappear
+      # llama3.3:70b is NOT included — it is a real model tag now.
+      # Only qwen3.6:35b-a3b and gemma4:26b-a4b are known-fictional.
       # ---------------------------------------------------------------------
       - name: 'No fictional model tags in script'
         run: |
-          if grep -qE 'qwen3\.6:35b-a3b|gemma4:26b-a4b|llama3\.3:70b' llmstack-macos.sh; then
+          if grep -qE 'qwen3\.6:35b-a3b|gemma4:26b-a4b' llmstack-macos.sh; then
             echo "FAIL: found a known-fictional model tag in the script"
-            grep -nE 'qwen3\.6:35b-a3b|gemma4:26b-a4b|llama3\.3:70b' llmstack-macos.sh
+            grep -nE 'qwen3\.6:35b-a3b|gemma4:26b-a4b' llmstack-macos.sh
             exit 1
           fi
           echo "No fictional tags found"
 
       - name: 'No fictional model tags in generated catalogue'
         run: |
-          if grep -qE 'qwen3\.6:35b-a3b|gemma4:26b-a4b|llama3\.3:70b' \
+          if grep -qE 'qwen3\.6:35b-a3b|gemma4:26b-a4b' \
             "$HOME/.config/llmstack/models.catalog"; then
             echo "FAIL: found a known-fictional model tag in the catalogue"
             exit 1
@@ -427,7 +429,7 @@ jobs:
 
       - name: 'No fictional tags in macOS-generated catalogue'
         run: |
-          if grep -qE 'qwen3\.6:35b-a3b|gemma4:26b-a4b|llama3\.3:70b' \
+          if grep -qE 'qwen3\.6:35b-a3b|gemma4:26b-a4b' \
             "$HOME/.config/llmstack/models.catalog"; then
             echo "FAIL: fictional tag in catalogue"
             exit 1
