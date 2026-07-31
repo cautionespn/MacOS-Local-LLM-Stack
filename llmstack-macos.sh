@@ -1,4 +1,3 @@
-```bash
 #!/bin/bash
 #
 # llmstack-macos.sh  v3.1.2
@@ -1533,4 +1532,3 @@ cat <<DONE
   Uninstall:      ./${SCRIPT_NAME} --uninstall
 ===========================================================================
 DONE
-```
