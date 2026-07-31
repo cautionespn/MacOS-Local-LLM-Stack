@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# llmstack-macos.sh  v3.1.5
+# llmstack-macos.sh  v3.2.0
 #
 # A self-contained, private LLM stack for macOS on Apple Silicon.
 #
@@ -22,8 +22,8 @@ set -euo pipefail
 # Constants
 # ---------------------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="3.1.5"
-CATALOG_DATE="2025-01-15"
+SCRIPT_VERSION="3.2.0"
+CATALOG_DATE="2026-07-31"
 CATALOG_WARN_DAYS=90
 CATALOG_STALE_DAYS=180
 
@@ -208,6 +208,8 @@ check_stray_llm_defs() {
 # ===========================================================================
 # MODEL CATALOGUE
 # ===========================================================================
+# Model tags verified against https://ollama.com/library on 2026-07-31.
+# Sizes are approximate for the default Q4_0 quantization used by Ollama.
 write_default_catalog() {
   mkdir -p "$CONFIG_DIR"
   cat > "$CATALOG" <<CATALOG_EOF
@@ -247,27 +249,35 @@ write_default_catalog() {
 # Format: MIN_RAM_GB|TAG|SIZE_GB|ARCH|ROLE|VERIFIED|NOTES
 # ===========================================================================
 # --- Daily drivers ---------------------------------------------------------
-48|qwen2.5:32b-instruct|19|dense|daily|yes|Strong general-purpose model. Fits comfortably with headroom for long context.
-32|qwen2.5:32b-instruct|19|dense|daily|yes|Fits with limited headroom for long context.
+# llama3.3:70b is Meta's improved 70B — same size as 3.1, better quality.
+# gemma3 models are multimodal (text + image input).
+# phi4 is Microsoft's 14B — excellent reasoning, strong on 16 GB machines.
+48|llama3.3:70b|43|dense|daily|yes|Meta's improved 70B. Same size as 3.1, better quality. Slow on anything below Max tier.
+32|qwen2.5:32b-instruct|19|dense|daily|yes|Strong general-purpose model. Fits with limited headroom for long context.
+16|gemma3:12b|8|dense|daily|yes|Google Gemma 3. Multimodal (text+image). Excellent quality for the size.
 16|qwen2.5:14b-instruct|9|dense|daily|yes|Solid mid-size model for 16 GB machines.
-8|qwen2.5:7b-instruct|5|dense|light|yes|Fast and capable for constrained machines.
-4|qwen2.5:3b|2|dense|light|yes|Small model for very constrained machines. Verified at ollama.com/library.
-8|llama3.2:3b|2|dense|light|yes|Very small, very fast. Good fallback for 8 GB machines.
+16|phi4:14b|9|dense|daily|yes|Microsoft Phi-4. Excellent reasoning and code for 14B.
+8|qwen2.5:7b-instruct|5|dense|daily|yes|Fast and capable for constrained machines.
+4|gemma3:4b|3|dense|daily|yes|Google Gemma 3. Multimodal. Small but capable.
+4|llama3.2:3b|2|dense|light|yes|Very small, very fast. Good fallback for constrained machines.
+# --- Reasoning (DeepSeek R1) -----------------------------------------------
+# DeepSeek R1 distills produce chain-of-thought reasoning tokens before
+# the final answer. Excellent for math, logic, and complex analysis.
+# Slower than instruct models for simple chat — use daily drivers for that.
+48|deepseek-r1:70b|43|dense|reasoning|yes|Distilled from Llama 3.1 70B. Best open reasoning model. Produces chain-of-thought.
+32|deepseek-r1:32b|19|dense|reasoning|yes|Distilled from Qwen 2.5 32B. Strong reasoning, fits 32 GB.
+16|deepseek-r1:14b|9|dense|reasoning|yes|Distilled from Qwen 2.5 14B. Good reasoning for 16 GB machines.
+8|deepseek-r1:8b|5|dense|reasoning|yes|Distilled from Llama 3.1 8B. Reasoning on constrained machines.
 # --- Coding ----------------------------------------------------------------
 48|qwen2.5-coder:32b-instruct|19|dense|coding|yes|Code-specialised. Excellent for programming tasks.
 32|qwen2.5-coder:14b-instruct|9|dense|coding|yes|Lighter coding option.
-16|qwen2.5-coder:14b-instruct|9|dense|coding|yes|Good coding model for 16 GB machines.
 8|qwen2.5-coder:7b-instruct|5|dense|coding|yes|Small coding model.
-4|qwen2.5-coder:3b|2|dense|coding|yes|Tiny coding model for constrained machines. Verified at ollama.com/library.
-# --- Large dense, high memory only ----------------------------------------
-96|llama3.1:70b|43|dense|daily|yes|Dense 70B. Slow on anything below Max tier.
-64|llama3.1:70b|43|dense|daily|yes|Fits on 64 GB but tight. Consider qwen2.5:32b instead.
 # --- Vision ----------------------------------------------------------------
 32|llama3.2-vision:11b|7|dense|vision|yes|Multimodal vision-language model.
 16|llama3.2-vision:11b|7|dense|vision|yes|Vision model for 16 GB machines.
+16|gemma3:12b|8|dense|vision|yes|Gemma 3 is multimodal. Good vision option for 16 GB machines.
 # --- MoE (preferred for bandwidth-limited chips) ---------------------------
-48|mixtral:8x7b|26|moe|daily|yes|8-expert MoE. Fast inference, large weights.
-32|qwen2.5:32b-instruct|19|dense|daily|yes|Dense alternative if Mixtral is too large.
+48|mixtral:8x7b|26|moe|daily|yes|8-expert MoE. Fast inference, large weights. Good for bandwidth-limited chips.
 CATALOG_EOF
 }
 
@@ -338,6 +348,9 @@ detect_system() {
   local mem_bytes
   mem_bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
   SYS_RAM_GB=$(( mem_bytes / 1024 / 1024 / 1024 ))
+  # If sysctl failed (e.g. on Linux CI), default to 8 GB so the budget
+  # is non-zero and at least the light-tier entries match.
+  [ "$SYS_RAM_GB" -gt 0 ] || SYS_RAM_GB=8
   SYS_USABLE_GB=$(( SYS_RAM_GB * 70 / 100 ))
   # macOS: df -g shows in GB. Linux: fall back to df -h (MB) or empty.
   SYS_DISK_FREE_GB="$(df -g "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')" || \
@@ -454,7 +467,7 @@ RECOMMENDED MODELS
 SYSINFO2
   local role line tag size arch verified notes found
   found="no"
-  for role in daily coding vision light; do
+  for role in daily reasoning coding vision light; do
     line="$(best_for_role "$role")"
     [ -n "$line" ] || continue
     found="yes"
@@ -463,12 +476,12 @@ SYSINFO2
     arch="$(field "$line" 4)"
     verified="$(field "$line" 6)"
     notes="$(field "$line" 7)"
-    printf '\n  %-8s %s\n' "${role}:" "$tag"
-    printf '           %s GB, %s' "$size" "$arch"
+    printf '\n  %-12s %s\n' "${role}:" "$tag"
+    printf '             %s GB, %s' "$size" "$arch"
     if [ "$verified" != "yes" ]; then
       printf '  [tag UNVERIFIED]'
     fi
-    printf '\n           %s\n' "$notes"
+    printf '\n             %s\n' "$notes"
   done
   if [ "$found" = "no" ]; then
     printf '\n  Nothing in the catalogue fits a %s GB budget.\n' "$SYS_USABLE_GB"
@@ -1074,9 +1087,6 @@ cat <<'DETECTED_FTR'
 DETECTED_FTR
 
 # --- port conflict check ---------------------------------------------------
-# NOTE: 'holder' is intentionally NOT declared local — this is the main
-# script body, not a function. 'local' outside a function is a bash error
-# that exits the script under set -e.
 holder=""
 if holder="$(port_in_use "$WEBUI_PORT")"; then
   warn "Port ${WEBUI_PORT} is already in use."
