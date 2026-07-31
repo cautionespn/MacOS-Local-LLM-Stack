@@ -1,4 +1,3 @@
-```yaml
 name: CI
 
 on:
@@ -432,4 +431,3 @@ jobs:
           [ "$lint" = "success" ] && [ "$test" = "success" ] \
             || { echo "FAIL: one or more jobs failed"; exit 1; }
           echo "All required jobs passed"
-```
