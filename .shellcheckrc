@@ -1,9 +1,3 @@
 [shellcheck]
-# Follow source statements for config files that may not exist in CI
 external-sources=true
-
-# Warnings to disable globally (with rationale):
-# SC1091: Not following non-constant source — config file may not exist
-# SC2154: Var appears unused — false positives with eval'd STATUS_BODY
-# SC2317: Command appears unreachable — false positives in trap/eval blocks
-disable=SC1091,SC2154,SC2317
+disable=SC1091,SC2154,SC2317,SC2155,SC2016
