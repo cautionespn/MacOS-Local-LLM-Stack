@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# llmstack-macos.sh  v3.1.4
+# llmstack-macos.sh  v3.1.5
 #
 # A self-contained, private LLM stack for macOS on Apple Silicon.
 #
@@ -22,7 +22,7 @@ set -euo pipefail
 # Constants
 # ---------------------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="3.1.4"
+SCRIPT_VERSION="3.1.5"
 CATALOG_DATE="2025-01-15"
 CATALOG_WARN_DAYS=90
 CATALOG_STALE_DAYS=180
@@ -251,12 +251,14 @@ write_default_catalog() {
 32|qwen2.5:32b-instruct|19|dense|daily|yes|Fits with limited headroom for long context.
 16|qwen2.5:14b-instruct|9|dense|daily|yes|Solid mid-size model for 16 GB machines.
 8|qwen2.5:7b-instruct|5|dense|light|yes|Fast and capable for constrained machines.
+4|qwen2.5:3b|2|dense|light|yes|Small model for very constrained machines. Verified at ollama.com/library.
 8|llama3.2:3b|2|dense|light|yes|Very small, very fast. Good fallback for 8 GB machines.
 # --- Coding ----------------------------------------------------------------
 48|qwen2.5-coder:32b-instruct|19|dense|coding|yes|Code-specialised. Excellent for programming tasks.
 32|qwen2.5-coder:14b-instruct|9|dense|coding|yes|Lighter coding option.
 16|qwen2.5-coder:14b-instruct|9|dense|coding|yes|Good coding model for 16 GB machines.
 8|qwen2.5-coder:7b-instruct|5|dense|coding|yes|Small coding model.
+4|qwen2.5-coder:3b|2|dense|coding|yes|Tiny coding model for constrained machines. Verified at ollama.com/library.
 # --- Large dense, high memory only ----------------------------------------
 96|llama3.1:70b|43|dense|daily|yes|Dense 70B. Slow on anything below Max tier.
 64|llama3.1:70b|43|dense|daily|yes|Fits on 64 GB but tight. Consider qwen2.5:32b instead.
