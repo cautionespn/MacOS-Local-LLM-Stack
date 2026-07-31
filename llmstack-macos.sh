@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# llmstack-macos.sh  v3.1.3
+# llmstack-macos.sh  v3.1.4
 #
 # A self-contained, private LLM stack for macOS on Apple Silicon.
 #
@@ -22,7 +22,7 @@ set -euo pipefail
 # Constants
 # ---------------------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="3.1.3"
+SCRIPT_VERSION="3.1.4"
 CATALOG_DATE="2025-01-15"
 CATALOG_WARN_DAYS=90
 CATALOG_STALE_DAYS=180
@@ -384,13 +384,18 @@ field() { echo "$1" | awk -F'|' -v n="$2" '{gsub(/^[ \t]+|[ \t]+$/, "", $n); pri
 # ---------------------------------------------------------------------------
 # Shared status logic — single source of truth for show_status AND .zshrc
 # ---------------------------------------------------------------------------
+# IMPORTANT: The config-source line uses if/then/fi, NOT [ ] && . , because
+# under set -e, "[ -f file ] && . file" returns 1 when the file is absent,
+# which kills the calling function. if/then/fi always returns 0.
 # shellcheck disable=SC2016
 STATUS_BODY='
 _llmstack_conf() {
   SEARXNG_MODE="local"
   SEARXNG_URL="http://127.0.0.1:8888"
   WEBUI_PORT="8080"
-  [ -f "$HOME/.config/llmstack/config" ] && . "$HOME/.config/llmstack/config"
+  if [ -f "$HOME/.config/llmstack/config" ]; then
+    . "$HOME/.config/llmstack/config"
+  fi
 }
 _llmstack_status() {
   _llmstack_conf
