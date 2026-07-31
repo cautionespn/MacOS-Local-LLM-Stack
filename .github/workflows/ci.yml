@@ -399,6 +399,8 @@ jobs:
         run: |
           set +e
           output=$(./llmstack-macos.sh --recommend 2>&1)
+          echo "$output"
+          # Check for any role label followed by a colon
           echo "$output" | grep -qE '(daily|coding|vision|light):' \
             || { echo "FAIL: no model recommended"; exit 1; }
           echo "At least one model recommended"
