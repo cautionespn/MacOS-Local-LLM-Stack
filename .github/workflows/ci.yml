@@ -183,9 +183,6 @@ jobs:
 
       # ---------------------------------------------------------------------
       # --status
-      # Uses set +e because --status may exit non-zero on a machine with
-      # no services running (curl returns non-zero). We only care that the
-      # output contains the expected lines.
       # ---------------------------------------------------------------------
       - name: '--status reports component health'
         run: |
@@ -266,7 +263,7 @@ jobs:
             | grep -v '^$' \
             | awk -F'|' '{
                 gsub(/^[ \t]+|[ \t]+$/, "", $5)
-                if ($5 !~ /^(daily|coding|vision|light)$/) {
+                if ($5 !~ /^(daily|coding|vision|light|reasoning)$/) {
                   printf "FAIL: ROLE column is '%s'\n", $5
                   exit 1
                 }
@@ -401,7 +398,7 @@ jobs:
           output=$(./llmstack-macos.sh --recommend 2>&1)
           echo "$output"
           # Check for any role label followed by a colon
-          echo "$output" | grep -qE '(daily|coding|vision|light):' \
+          echo "$output" | grep -qE '(daily|coding|vision|light|reasoning):' \
             || { echo "FAIL: no model recommended"; exit 1; }
           echo "At least one model recommended"
 
