@@ -1,7 +1,7 @@
 ```bash
 #!/bin/bash
 #
-# llmstack-macos.sh  v3.1.1
+# llmstack-macos.sh  v3.1.2
 #
 # A self-contained, private LLM stack for macOS on Apple Silicon.
 #
@@ -23,7 +23,7 @@ set -euo pipefail
 # Constants
 # ---------------------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="3.1.1"
+SCRIPT_VERSION="3.1.2"
 CATALOG_DATE="2025-01-15"
 CATALOG_WARN_DAYS=90
 CATALOG_STALE_DAYS=180
@@ -281,11 +281,16 @@ catalog_date() {
   grep -m1 '^# Last-Updated:' "$CATALOG" 2>/dev/null | awk '{print $3}'
 }
 
+# Portable date-to-epoch: tries macOS date -j first, then GNU date -d.
+# Works on macOS (for real use) and on Linux (for CI testing).
 catalog_age_days() {
   local d cat_epoch now_epoch
   d="$(catalog_date)"
   [ -n "$d" ] || return 0
-  cat_epoch="$(date -j -f "%Y-%m-%d" "$d" "+%s" 2>/dev/null)" || return 0
+  # macOS: date -j -f "<format>" "<input>" "+%s"
+  # Linux:  date -d "<input>" "+%s"
+  cat_epoch="$(date -j -f "%Y-%m-%d" "$d" "+%s" 2>/dev/null)" || \
+    cat_epoch="$(date -d "$d" "+%s" 2>/dev/null)" || return 0
   now_epoch="$(date "+%s")"
   echo $(( (now_epoch - cat_epoch) / 86400 ))
 }
@@ -323,6 +328,8 @@ report_catalog_age() {
 # ===========================================================================
 # SYSTEM DETECTION
 # ===========================================================================
+# Works on macOS (real hardware) and on Linux (CI). On Linux, sysctl keys
+# and df -g don't exist, so values fall back to 0/unknown gracefully.
 detect_system() {
   SYS_CHIP="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo 'unknown')"
   SYS_CORES="$(sysctl -n hw.ncpu 2>/dev/null || echo '?')"
@@ -330,7 +337,10 @@ detect_system() {
   mem_bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
   SYS_RAM_GB=$(( mem_bytes / 1024 / 1024 / 1024 ))
   SYS_USABLE_GB=$(( SYS_RAM_GB * 70 / 100 ))
-  SYS_DISK_FREE_GB="$(df -g "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')"
+  # macOS: df -g shows in GB. Linux: fall back to df -h (MB) or empty.
+  SYS_DISK_FREE_GB="$(df -g "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')" || \
+    SYS_DISK_FREE_GB="$(df -h "$HOME" 2>/dev/null | awk 'NR==2 {print $4}' | tr -d 'G')" || \
+    SYS_DISK_FREE_GB=""
   [ -n "$SYS_DISK_FREE_GB" ] || SYS_DISK_FREE_GB=0
   case "$SYS_CHIP" in
     *Ultra*) SYS_TIER="Ultra" ;;
@@ -374,6 +384,7 @@ field() { echo "$1" | awk -F'|' -v n="$2" '{gsub(/^[ \t]+|[ \t]+$/, "", $n); pri
 # ---------------------------------------------------------------------------
 # Shared status logic — single source of truth for show_status AND .zshrc
 # ---------------------------------------------------------------------------
+# shellcheck disable=SC2016
 STATUS_BODY='
 _llmstack_conf() {
   SEARXNG_MODE="local"
@@ -464,7 +475,7 @@ SYSINFO
 # ===========================================================================
 load_config() {
   if [ -f "$CONFIG_FILE" ]; then
-    # shellcheck disable=SC1090
+    # shellcheck source=/dev/null
     . "$CONFIG_FILE"
   fi
 }
@@ -693,8 +704,6 @@ do_update() {
   sudo launchctl bootstrap system "$OLLAMA_PLIST" 2>/dev/null || true
   sudo launchctl bootstrap system "$OPENWEBUI_PLIST" 2>/dev/null || true
   log "Waiting for services"
-  # Poll for readiness rather than sleeping a fixed duration. Each curl
-  # has --max-time so a hung service doesn't block indefinitely.
   for i in $(seq 1 30); do
     if curl -s -o /dev/null --max-time 2 http://127.0.0.1:11434/api/version 2>/dev/null \
        && curl -s -o /dev/null --max-time 2 "http://127.0.0.1:${WEBUI_PORT}" 2>/dev/null; then
@@ -1053,9 +1062,10 @@ cat <<DETECTED
 DETECTED
 
 # --- port conflict check ---------------------------------------------------
-# Report not just that the port is busy, but what holds it, so the user
-# can decide what to kill or reconfigure.
-local holder
+# NOTE: 'holder' is intentionally NOT declared local — this is the main
+# script body, not a function. 'local' outside a function is a bash error
+# that exits the script under set -e.
+holder=""
 if holder="$(port_in_use "$WEBUI_PORT")"; then
   warn "Port ${WEBUI_PORT} is already in use."
   echo "    Held by: $holder"
