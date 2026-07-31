@@ -1,3 +1,4 @@
+```yaml
 name: CI
 
 on:
@@ -33,14 +34,16 @@ jobs:
       - name: Shellcheck
         run: shellcheck -x llmstack-macos.sh
 
-      - name: No executable stack
+      - name: Verify shebang
         run: |
-          # The script has no shebang for sh; confirm it's bash-only
           head -1 llmstack-macos.sh | grep -q '^#!/bin/bash' \
             || { echo "FAIL: shebang is not #!/bin/bash"; exit 1; }
 
   # ===========================================================================
   # CLI Tests — runs on Ubuntu; tests argument handling, output, catalogue
+  # The script is designed for macOS but --help, --version, arg parsing,
+  # --recommend (catalogue generation), and --status all work cross-platform
+  # because detect_system() and date functions have Linux fallbacks.
   # ===========================================================================
   test:
     name: CLI Tests
@@ -77,7 +80,7 @@ jobs:
             || { echo "FAIL: no version number found"; exit 1; }
 
       # ---------------------------------------------------------------------
-      # Argument validation — commands expected to fail
+      # Argument validation — commands expected to fail (exit 1)
       # ---------------------------------------------------------------------
       - name: 'Unknown argument exits 1'
         run: |
@@ -143,7 +146,7 @@ jobs:
           [ "$rc" -eq 1 ] || { echo "FAIL: expected exit 1, got $rc"; exit 1; }
 
       # ---------------------------------------------------------------------
-      # --recommend
+      # --recommend (runs on Ubuntu with Linux fallbacks in detect_system)
       # ---------------------------------------------------------------------
       - name: '--recommend produces hardware report'
         run: |
@@ -175,7 +178,7 @@ jobs:
           echo "Catalogue preserved across runs"
 
       # ---------------------------------------------------------------------
-      # --status
+      # --status (works cross-platform — just curl checks)
       # ---------------------------------------------------------------------
       - name: '--status reports component health'
         run: |
@@ -429,3 +432,4 @@ jobs:
           [ "$lint" = "success" ] && [ "$test" = "success" ] \
             || { echo "FAIL: one or more jobs failed"; exit 1; }
           echo "All required jobs passed"
+```
