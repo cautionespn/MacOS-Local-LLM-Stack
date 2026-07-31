@@ -178,6 +178,8 @@ jobs:
 
       # ---------------------------------------------------------------------
       # --status (works cross-platform — just curl checks)
+      # NOTE: On Ubuntu, no config file exists and no services are running,
+      # so everything reports DOWN — but the lines are still printed.
       # ---------------------------------------------------------------------
       - name: '--status reports component health'
         run: |
