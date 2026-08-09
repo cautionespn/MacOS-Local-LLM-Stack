@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# llmstack-macos.sh  v3.2.0
+# llmstack-macos.sh  v3.3.0
 #
 # A self-contained, private LLM stack for macOS on Apple Silicon.
 #
@@ -22,8 +22,8 @@ set -euo pipefail
 # Constants
 # ---------------------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="3.2.0"
-CATALOG_DATE="2026-07-31"
+SCRIPT_VERSION="3.3.0"
+CATALOG_DATE="2026-08-09"
 CATALOG_WARN_DAYS=90
 CATALOG_STALE_DAYS=180
 
@@ -68,6 +68,7 @@ WEBUI_BIND="0.0.0.0"
 SKIP_DRAWTHINGS="no"
 SKIP_MODEL="no"
 FORCE_MODEL=""
+DISCOVER="no"
 ACTUAL_USER="$(id -un)"
 
 # ---------------------------------------------------------------------------
@@ -208,7 +209,7 @@ check_stray_llm_defs() {
 # ===========================================================================
 # MODEL CATALOGUE
 # ===========================================================================
-# Model tags verified against https://ollama.com/library on 2026-07-31.
+# Model tags verified against https://ollama.com/library on 2026-08-09.
 # Sizes are approximate for the default Q4_0 quantization used by Ollama.
 write_default_catalog() {
   mkdir -p "$CONFIG_DIR"
@@ -335,6 +336,283 @@ report_catalog_age() {
     printf '  Recent enough. No action needed.\n'
   fi
   printf '\n'
+}
+
+# ===========================================================================
+# MODEL REGISTRY VALIDATION & CATALOGUE REFRESH  (v3.3.0)
+# ===========================================================================
+# All registry access uses the Ollama manifest endpoint. Its behaviour was
+# confirmed by direct probe: a live tag returns HTTP 200, a non-existent tag
+# returns 404, and no auth handshake is required.
+#
+#   https://registry.ollama.ai/v2/library/<n>/manifests/<tag>
+#
+# Every function here is FAIL-SOFT: a network error, timeout, or any status
+# other than 200/404 is treated as "unknown" and never changes the live
+# catalogue. This keeps --update reliable when the registry is unreachable,
+# and keeps CI (which has no registry access) green: --check-models and
+# --refresh-catalog both exit 0 even when every probe fails.
+REGISTRY_BASE="https://registry.ollama.ai/v2/library"
+REGISTRY_ACCEPT="application/vnd.docker.distribution.manifest.v2+json"
+# Common size tokens probed when looking for newer variants within a family
+# already in the catalogue. Each candidate is manifest-confirmed before it is
+# ever proposed, so a wrong guess simply 404s and is discarded.
+PROBE_SIZES="1.5b 3b 4b 7b 8b 9b 11b 12b 14b 22b 27b 30b 32b 34b 70b 72b"
+
+# Trim leading/trailing whitespace safely. Never use xargs for this: it
+# treats quotes specially and mangles NOTES containing apostrophes.
+_trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# Probe one tag. Echoes LIVE, DEAD, or UNKNOWN.
+registry_probe() {
+  local tag="$1" name ver code
+  name="${tag%%:*}"
+  ver="${tag##*:}"
+  if [ "$name" = "$ver" ]; then echo "UNKNOWN"; return 0; fi
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+    -H "Accept: ${REGISTRY_ACCEPT}" \
+    "${REGISTRY_BASE}/${name}/manifests/${ver}" 2>/dev/null || echo "000")"
+  case "$code" in
+    200) echo "LIVE" ;;
+    404) echo "DEAD" ;;
+    *)   echo "UNKNOWN" ;;
+  esac
+}
+
+# True if the registry is reachable at all (one cheap probe of a known tag).
+registry_reachable() {
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+    -H "Accept: ${REGISTRY_ACCEPT}" \
+    "${REGISTRY_BASE}/llama3.3/manifests/70b" 2>/dev/null || echo "000")"
+  [ "$code" = "200" ] || [ "$code" = "404" ]
+}
+
+# Unique family prefixes (text before the colon) from the live catalogue.
+catalog_families() {
+  [ -f "$CATALOG" ] || return 0
+  grep -v '^#' "$CATALOG" | grep -v '^$' \
+    | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/,"",$2); split($2,a,":"); print a[1]}' \
+    | sort -u
+}
+
+# All tags currently in the catalogue, one per line, trimmed.
+catalog_tags() {
+  [ -f "$CATALOG" ] || return 0
+  grep -v '^#' "$CATALOG" | grep -v '^$' \
+    | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}'
+}
+
+# ---------------------------------------------------------------------------
+# Part A: validate every catalogue tag against the registry.
+# Reports LIVE/DEAD/UNKNOWN. With argument "fix", rewrites the live catalogue
+# in place to correct the VERIFIED column (200 -> yes, 404 -> no), preserving
+# every other column, after taking a timestamped backup. UNKNOWN never
+# changes anything. Always returns 0 (fail-soft).
+# ---------------------------------------------------------------------------
+validate_catalog_tags() {
+  local fix="${1:-report}"
+  ensure_catalog
+  if ! registry_reachable; then
+    warn "Cannot reach the Ollama registry. Skipping tag validation."
+    echo "    The existing catalogue is unchanged; this is not an error."
+    return 0
+  fi
+  local live=0 dead=0 unknown=0 changed=0 tmp
+  tmp="$(mktemp)"
+  log "Validating catalogue tags against the Ollama registry"
+  while IFS= read -r rawline; do
+    case "$rawline" in
+      '#'*|'') printf '%s\n' "$rawline" >> "$tmp"; continue ;;
+    esac
+    local ram tag size arch role ver notes status trimtag
+    IFS='|' read -r ram tag size arch role ver notes <<< "$rawline"
+    trimtag="$(_trim "$tag")"
+    status="$(registry_probe "$trimtag")"
+    case "$status" in
+      LIVE)
+        live=$((live+1)); ok "  LIVE  $trimtag"
+        if [ "$(_trim "$ver")" != "yes" ]; then ver="yes"; changed=$((changed+1)); fi
+        ;;
+      DEAD)
+        dead=$((dead+1)); warn "  DEAD  $trimtag  (404 — retired or renamed)"
+        if [ "$(_trim "$ver")" != "no" ]; then ver="no"; changed=$((changed+1)); fi
+        ;;
+      *)
+        unknown=$((unknown+1)); printf '  ????  %s  (registry unreachable for this tag)\n' "$trimtag"
+        ;;
+    esac
+    printf '%s|%s|%s|%s|%s|%s|%s\n' \
+      "$(_trim "$ram")" "$trimtag" "$(_trim "$size")" "$(_trim "$arch")" \
+      "$(_trim "$role")" "$(_trim "$ver")" "$(_trim "$notes")" >> "$tmp"
+  done < "$CATALOG"
+  printf '\nValidation summary: %d live, %d dead, %d unknown.\n' "$live" "$dead" "$unknown"
+  if [ "$fix" = "fix" ] && [ "$changed" -gt 0 ]; then
+    cp "$CATALOG" "${CATALOG}.backup-$(date +%Y%m%d-%H%M%S)"
+    mv "$tmp" "$CATALOG"
+    ok "Corrected the VERIFIED column on $changed entries. Backup kept."
+  else
+    rm -f "$tmp"
+    if [ "$dead" -gt 0 ]; then
+      echo "Run --refresh-catalog to produce a cleaned proposal you can review."
+    fi
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Part B-lite: probe common tag patterns within each catalogue family for
+# variants not already present. Registry-only; every hit is manifest-
+# confirmed. Echoes confirmed new "family:tag" candidates, one per line.
+# ---------------------------------------------------------------------------
+probe_family_variants() {
+  local families existing fam base suffix cand
+  families="$(catalog_families)"
+  existing="$(catalog_tags)"
+  for fam in $families; do
+    for base in $PROBE_SIZES; do
+      for suffix in "" "-instruct"; do
+        cand="${fam}:${base}${suffix}"
+        printf '%s\n' "$existing" | grep -qx "$cand" && continue
+        if [ "$(registry_probe "$cand")" = "LIVE" ]; then
+          printf '%s\n' "$cand"
+        fi
+      done
+    done
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Part B-full (optional, --discover): scrape ollama.com/library for family
+# names not in the catalogue. FRAGILE (HTML), so wholly fail-soft: any
+# failure yields no candidates and a note, never an error. Every scraped
+# name is manifest-confirmed before being emitted.
+# ---------------------------------------------------------------------------
+discover_new_families() {
+  local html names fam known
+  html="$(curl -s --max-time 15 "https://ollama.com/library" 2>/dev/null || true)"
+  if [ -z "$html" ]; then
+    warn "Could not fetch the library index; skipping discovery." >&2
+    echo "    Proposal is based on validated tags and the family watchlist." >&2
+    return 0
+  fi
+  names="$(printf '%s' "$html" \
+    | grep -oE 'href="/library/[a-zA-Z0-9._-]+"' \
+    | sed -E 's#href="/library/([^"]+)"#\1#' \
+    | sort -u)"
+  known="$(catalog_families)"
+  for fam in $names; do
+    printf '%s\n' "$known" | grep -qx "$fam" && continue
+    if [ "$(registry_probe "${fam}:latest")" = "LIVE" ]; then
+      printf '%s\n' "$fam"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Part B/C core: build models.catalog.proposed next to the live file.
+#   - Re-validates every existing tag (SIZE/VERIFIED updated, all judgment
+#     columns MIN_RAM/ARCH/ROLE/NOTES preserved; dead tags commented out).
+#   - Appends B-lite family variants as REVIEW rows (VERIFIED=yes, but
+#     MIN_RAM/ROLE/NOTES marked REVIEW for the human to set).
+#   - With $1 = "discover", also appends B-full discovered families.
+# Never touches the live catalogue. Echoes the proposal path. Returns 0.
+# ---------------------------------------------------------------------------
+build_catalog_proposal() {
+  local discover="${1:-no}"
+  ensure_catalog
+  local proposed="${CATALOG}.proposed"
+  if ! registry_reachable; then
+    warn "Cannot reach the Ollama registry. No proposal was written."
+    echo "    Try again when the network can reach registry.ollama.ai."
+    return 0
+  fi
+  log "Building a catalogue proposal (live file is not touched)"
+  local tmp; tmp="$(mktemp)"
+  # 1) header, with a refreshed date
+  {
+    grep '^#' "$CATALOG" | sed "s/^# Last-Updated:.*/# Last-Updated: $(date +%Y-%m-%d)/"
+    echo ""
+  } > "$tmp"
+  # 2) re-validate existing entries
+  local live=0 dead=0
+  while IFS= read -r rawline; do
+    case "$rawline" in '#'*|'') continue ;; esac
+    local ram tag size arch role ver notes trimtag status
+    IFS='|' read -r ram tag size arch role ver notes <<< "$rawline"
+    trimtag="$(_trim "$tag")"
+    status="$(registry_probe "$trimtag")"
+    ram="$(_trim "$ram")"; size="$(_trim "$size")"; arch="$(_trim "$arch")"
+    role="$(_trim "$role")"; notes="$(_trim "$notes")"
+    case "$status" in
+      LIVE) live=$((live+1))
+        printf '%s|%s|%s|%s|%s|yes|%s\n' "$ram" "$trimtag" "$size" "$arch" "$role" "$notes" >> "$tmp" ;;
+      DEAD) dead=$((dead+1))
+        printf '# DEAD (404 at registry, review/remove): %s|%s|%s|%s|%s|no|%s\n' \
+          "$ram" "$trimtag" "$size" "$arch" "$role" "$notes" >> "$tmp" ;;
+      *)  # unknown: pass through unchanged
+        printf '%s|%s|%s|%s|%s|%s|%s\n' "$ram" "$trimtag" "$size" "$arch" "$role" "$(_trim "$ver")" "$notes" >> "$tmp" ;;
+    esac
+  done < "$CATALOG"
+  # 3) B-lite family variants
+  local variants added=0
+  variants="$(probe_family_variants)"
+  if [ -n "$variants" ]; then
+    printf '# --- Proposed variants (B-lite; set MIN_RAM/ROLE/NOTES) ---\n' >> "$tmp"
+    while IFS= read -r cand; do
+      [ -n "$cand" ] || continue
+      printf 'REVIEW|%s|REVIEW|dense|daily|yes|REVIEW - confirmed in registry, set MIN_RAM/ROLE/SIZE.\n' "$cand" >> "$tmp"
+      added=$((added+1))
+    done <<< "$variants"
+  fi
+  # 4) B-full discovery (optional)
+  if [ "$discover" = "discover" ]; then
+    local fams
+    fams="$(discover_new_families)"
+    if [ -n "$fams" ]; then
+      printf '# --- Discovered families (B-full; unverified sizing) ---\n' >> "$tmp"
+      while IFS= read -r fam; do
+        [ -n "$fam" ] || continue
+        printf 'REVIEW|%s:latest|REVIEW|dense|daily|yes|REVIEW - new family from library scrape.\n' "$fam" >> "$tmp"
+        added=$((added+1))
+      done <<< "$fams"
+    fi
+  fi
+  mv "$tmp" "$proposed"
+  printf '\n'
+  ok "Wrote proposal: $proposed"
+  printf 'Summary: %d live, %d dead, %d new candidate(s) added for review.\n' "$live" "$dead" "$added"
+  printf '\nReview it, then compare against the live file:\n'
+  printf '  diff "%s" "%s"\n' "$CATALOG" "$proposed"
+  printf 'If you approve, replace the live catalogue:\n'
+  printf '  mv "%s" "%s"\n\n' "$proposed" "$CATALOG"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Part C: apply the proposal over the live catalogue, after backup + confirm.
+# ---------------------------------------------------------------------------
+apply_catalog_proposal() {
+  local discover="${1:-no}"
+  build_catalog_proposal "$discover"
+  local proposed="${CATALOG}.proposed"
+  [ -f "$proposed" ] || { warn "No proposal to apply."; return 0; }
+  printf '\n'
+  diff "$CATALOG" "$proposed" || true
+  printf '\n'
+  if confirm "Replace the live catalogue with this proposal?"; then
+    cp "$CATALOG" "${CATALOG}.backup-$(date +%Y%m%d-%H%M%S)"
+    mv "$proposed" "$CATALOG"
+    ok "Catalogue updated. Backup kept alongside it."
+  else
+    log "Left the live catalogue unchanged. Proposal remains at $proposed"
+  fi
+  return 0
 }
 
 # ===========================================================================
@@ -552,6 +830,19 @@ MODES
     --uninstall     Guided teardown. Walks every artifact the script
                     created and asks before removing each one. All
                     destructive prompts default to NO.
+    --check-models  Validate every catalogue tag against the Ollama
+                    registry and correct the VERIFIED column in place.
+                    Read-only network probe; changes only that column.
+    --refresh-catalog
+                    Write models.catalog.proposed: re-validate every tag,
+                    comment out dead ones, and add newer variants found
+                    within your existing model families. Never touches the
+                    live catalogue. Add --discover to also scan the Ollama
+                    library for entirely new model families.
+    --refresh-catalog-apply
+                    As --refresh-catalog, then replace the live catalogue
+                    with the proposal after a backup and confirmation.
+                    Accepts --discover.
     --version       Print the script version and exit.
     --help          Show this text and exit.
 OPTIONS
@@ -569,6 +860,10 @@ OPTIONS
     --no-model      Do not download any model. Useful for setting up the
                     services first and choosing a model later.
     --no-drawthings Skip the Draw Things installation.
+    --discover      Only with --refresh-catalog / --refresh-catalog-apply.
+                    Additionally scrape the Ollama library for new model
+                    families. Fail-soft: if the scrape fails, the proposal
+                    still includes validated tags and family variants.
 COMPONENTS
     Homebrew            package manager, installed if missing
     python@3.11         runtime required by Open WebUI
@@ -619,6 +914,15 @@ MODEL SELECTION
     Catalogue entries carry a VERIFIED flag. Tags marked no are plausible
     but unconfirmed and may fail to pull; the script warns first and, if a
     pull fails, points at https://ollama.com/library rather than aborting.
+KEEPING THE CATALOGUE CURRENT
+    Model tags come and go. Three commands keep the catalogue honest, all
+    using the Ollama registry (a live tag returns 200, a missing tag 404):
+      --check-models        validate existing tags, fix the VERIFIED column
+      --refresh-catalog     write a reviewed proposal (never the live file)
+      --refresh-catalog-apply   apply that proposal after backup + confirm
+    --update runs the validation step automatically. All of these are
+    fail-soft: if the registry cannot be reached, they report that and make
+    no changes, so they are safe to run offline and in CI.
 SHELL INTEGRATION
     Adds a marked block to ~/.zshrc providing:
       llmstatus     health of every component
@@ -743,6 +1047,9 @@ do_update() {
   Backup retained at: $backup_dir
 UPDATED
   report_catalog_age
+  # Part A: validate catalogue tags against the registry and auto-correct
+  # the VERIFIED column in place. Fail-soft: a registry outage is a no-op.
+  validate_catalog_tags fix
   detect_system
   local line tag
   line="$(best_for_role daily)"
@@ -1019,6 +1326,10 @@ while [ $# -gt 0 ]; do
     --status)       MODE="status" ;;
     --recommend)    MODE="recommend" ;;
     --uninstall)    MODE="uninstall" ;;
+    --check-models) MODE="check-models" ;;
+    --refresh-catalog)       MODE="refresh-catalog" ;;
+    --refresh-catalog-apply) MODE="refresh-catalog-apply" ;;
+    --discover)     DISCOVER="yes" ;;
     --searxng-url)
       [ $# -ge 2 ] || error "--searxng-url needs a URL"
       SEARXNG_URL="${2%/}"
@@ -1051,6 +1362,9 @@ case "$MODE" in
   recommend) show_recommendations; exit 0 ;;
   uninstall) uninstall_stack ;;
   update)    do_update ;;
+  check-models)          validate_catalog_tags fix; exit 0 ;;
+  refresh-catalog)       build_catalog_proposal "$DISCOVER"; exit 0 ;;
+  refresh-catalog-apply) apply_catalog_proposal "$DISCOVER"; exit 0 ;;
 esac
 
 # ===========================================================================

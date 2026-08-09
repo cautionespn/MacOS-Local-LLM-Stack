@@ -318,6 +318,9 @@ jobs:
 
       # ---------------------------------------------------------------------
       # Catalogue-maintenance modes (v3.3.0) — offline-safe behaviour.
+      # CI has no registry access, so these must exit 0, write no proposal,
+      # and leave the live catalogue unchanged.
+      # ---------------------------------------------------------------------
       #
       # These modes reach the Ollama registry when it is available. To test
       # the fail-soft path deterministically we must GUARANTEE no registry
