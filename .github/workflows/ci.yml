@@ -316,6 +316,53 @@ jobs:
             || { echo "FAIL: --recommend produced different output on second run"; exit 1; }
           echo "Idempotent"
 
+      # ---------------------------------------------------------------------
+      # Catalogue-maintenance modes (v3.3.0) — offline-safe behaviour.
+      # CI has no registry access, so these must exit 0, write no proposal,
+      # and leave the live catalogue unchanged.
+      # ---------------------------------------------------------------------
+      - name: '--help mentions the catalogue-maintenance modes'
+        run: |
+          output=$(./llmstack-macos.sh --help)
+          for m in --check-models --refresh-catalog --refresh-catalog-apply --discover; do
+            echo "$output" | grep -q -- "$m" \
+              || { echo "FAIL: --help does not mention $m"; exit 1; }
+          done
+
+      - name: '--check-models exits 0 with no registry access'
+        run: |
+          set +e
+          ./llmstack-macos.sh --check-models >/dev/null 2>&1
+          rc=$?
+          [ "$rc" -eq 0 ] || { echo "FAIL: expected exit 0, got $rc"; exit 1; }
+          echo "check-models is offline-safe"
+
+      - name: '--refresh-catalog exits 0, writes no proposal, leaves catalogue unchanged'
+        run: |
+          cat="$HOME/.config/llmstack/models.catalog"
+          cp "$cat" /tmp/catalog_before
+          set +e
+          ./llmstack-macos.sh --refresh-catalog >/dev/null 2>&1
+          rc=$?
+          [ "$rc" -eq 0 ] || { echo "FAIL: expected exit 0, got $rc"; exit 1; }
+          [ ! -f "${cat}.proposed" ] \
+            || { echo "FAIL: a proposal was written with no registry access"; exit 1; }
+          diff -q "$cat" /tmp/catalog_before >/dev/null \
+            || { echo "FAIL: live catalogue changed"; exit 1; }
+          echo "refresh-catalog is offline-safe and non-destructive"
+
+      - name: '--refresh-catalog-apply exits 0 and leaves catalogue unchanged offline'
+        run: |
+          cat="$HOME/.config/llmstack/models.catalog"
+          cp "$cat" /tmp/catalog_before2
+          set +e
+          ./llmstack-macos.sh --refresh-catalog-apply >/dev/null 2>&1
+          rc=$?
+          [ "$rc" -eq 0 ] || { echo "FAIL: expected exit 0, got $rc"; exit 1; }
+          diff -q "$cat" /tmp/catalog_before2 >/dev/null \
+            || { echo "FAIL: live catalogue changed with no registry access"; exit 1; }
+          echo "refresh-catalog-apply is offline-safe"
+
   # ===========================================================================
   # macOS Tests — runs on Apple Silicon; tests real hardware detection
   # Conditional to conserve macOS runner minutes (10x billing rate)
