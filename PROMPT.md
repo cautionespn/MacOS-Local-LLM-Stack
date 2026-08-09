@@ -47,9 +47,9 @@ Install Homebrew, Python 3.11, and a container runtime only as needed. Prefer pi
 
 ## 6. Modes and CLI
 
-Modes: `--install` (default), `--update` (alias `--upgrade`), `--status`, `--recommend`, `--uninstall`, `--version`, `--help`.
+Modes: `--install` (default), `--update` (alias `--upgrade`), `--status`, `--recommend`, `--uninstall`, `--version`, `--check-models`, `--refresh-catalog`, `--refresh-catalog-apply`, `--help`.
 
-Options: `--searxng-url URL`, `--searxng-port PORT`, `--webui-port PORT`, `--model TAG`, `--no-model`, `--no-drawthings`.
+Options: `--searxng-url URL`, `--searxng-port PORT`, `--webui-port PORT`, `--model TAG`, `--no-model`, `--no-drawthings`, `--discover` (refresh modes only).
 
 - `--help` is comprehensive: synopsis, every mode and option, components, file layout, ports, startup behaviour *and its limits*, security note about the plist secret key, requirements, post-install steps, exit status, examples.
 - `--version` prints the script name and version, then exits 0.
@@ -57,6 +57,8 @@ Options: `--searxng-url URL`, `--searxng-port PORT`, `--webui-port PORT`, `--mod
 - `--uninstall` confirms **each artifact separately**. Every prompt defaults to no; bare Enter skips. Destroying user data takes two confirmations.
 - `--uninstall` never removes shared dependencies (Homebrew, Python, `mas`). Say so in the summary.
 - `--update` backs up user data before touching anything, and restarts the stack even if an upgrade step fails.
+- The catalogue-maintenance modes keep model tags current against the Ollama registry manifest endpoint (a live tag returns 200, a missing tag 404, no auth). `--check-models` validates every catalogue tag and corrects the VERIFIED column in place after a backup. `--refresh-catalog` writes `models.catalog.proposed` next to the live file — revalidated tags, dead ones commented out, newer size variants probed within existing families — and never touches the live catalogue. `--refresh-catalog-apply` applies that proposal after a backup and confirmation. `--discover` layers an optional `ollama.com/library` scrape on top of the refresh modes to find new families. `--update` runs the validation step automatically.
+- Every one of these is fail-soft: if the registry is unreachable, the command reports it and changes nothing, so it is safe offline and in CI. Every proposed candidate — family variant or discovered family — must be manifest-confirmed before it appears in a proposal, and must land with its judgment columns (MIN_RAM, ROLE, SIZE, NOTES) marked for human review rather than guessed.
 - All port arguments must be validated as integers in the range 1–65535 before anything is installed. Reject non-numeric, zero, negative, and out-of-range values immediately with a clear error.
 - Before installing, check whether the target ports (`--webui-port`, `--searxng-port` in local mode) are already in use. Warn clearly if they are, naming the conflicting port and the process that holds it (use `lsof` to identify the holder). Suggest `--webui-port` or `--searxng-port` to choose another. Do not abort — the user may be replacing a previous install — but warn so a silent failure is not the first symptom.
 
@@ -108,6 +110,9 @@ Each of these has bitten a working deployment. Handle them in code, not in prose
 13. **`WEBUI_BIND` must be persisted.** The bind address is used in the plist at install time, but the shell functions in `.zshrc` also need to know it (for status checks, for display). Write `WEBUI_BIND` to the config file alongside the other settings so the shell functions read it at call time.
 14. **Status logic divergence.** The code that checks component health runs in two places: the script's `--status` mode and the `llmstatus` shell function emitted into `.zshrc`. These must share a single code block (a string variable like `STATUS_BODY`) that is both `eval`'d by the script and written verbatim into `.zshrc`. Do not copy-paste the logic; copy-pasted duplicates drift apart and report different things.
 15. **Plist ownership.** `sudo tee` writes the file but does not guarantee `root:wheel` ownership. Explicitly `sudo chown root:wheel` and `sudo chmod 644` each plist after writing it.
+16. **Registry access must be fail-soft.** The catalogue-maintenance modes probe `registry.ollama.ai`. A network error, timeout, or any status other than 200/404 must be treated as "unknown" and must never change the live catalogue. `--check-models` and `--refresh-catalog` must exit 0 even when every probe fails, or CI (which has no registry access) breaks. Set `--max-time` on every registry call. Confirm reachability once up front and skip the whole operation with a clear message if the registry is down, rather than letting each probe time out in series.
+17. **The library scrape is the one fragile path — quarantine it.** Discovery (`--discover`) scrapes HTML from `ollama.com/library`, which changes without notice. It must be wholly optional and wholly fail-soft: a failed scrape yields no candidates and a note, never an error, and the reliable manifest-only path (validation + family-variant probing) must still produce a full proposal. Never let a scrape failure block or corrupt the proposal.
+18. **Never let automated data overwrite human judgment.** A proposal may update only the SIZE and VERIFIED columns of an existing entry; MIN_RAM, ARCH, ROLE, and NOTES are the operator's editorial judgment and must be preserved verbatim for every surviving tag. New candidates land with those columns marked for review, never guessed. Trim fields with parameter expansion, never `xargs` — `xargs` mangles NOTES containing apostrophes.
 
 ## 11. Script quality
 
@@ -155,6 +160,9 @@ Provide `.github/workflows/ci.yml` and `.shellcheckrc` that:
 - Catalogue format validation: 7 pipe-delimited fields, valid tag format (`[a-zA-Z0-9._:-]+`), VERIFIED column is `yes`/`no`, ARCH column is `moe`/`dense`, ROLE column is one of the known values, at least one verified daily driver.
 - Regression guard: known-fictional tags (`qwen3.6:35b-a3b`, `gemma4:26b-a4b`, `llama3.3:70b`) do not appear in the script or the generated catalogue.
 - Idempotency: `--recommend` produces identical output on consecutive runs.
+- Catalogue-maintenance modes are offline-safe: with no registry access (the CI condition), `--check-models`, `--refresh-catalog`, and `--refresh-catalog-apply` must each exit 0, must not write `models.catalog.proposed`, and must leave the live catalogue byte-for-byte unchanged. Verify the live catalogue is identical before and after.
+- `--help` mentions the new modes (`--check-models`, `--refresh-catalog`, `--refresh-catalog-apply`) and the `--discover` option.
+- The network-dependent behaviour of these modes (actual proposal generation) is exercised only on the conditional macOS job or via `workflow_dispatch`, never in the network-less Ubuntu job.
 
 ### macOS test job (Apple Silicon, conditional)
 - Only runs on pushes to `main` or manual `workflow_dispatch`, to conserve macOS runner minutes (billed at 10x rate).
