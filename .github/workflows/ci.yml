@@ -321,6 +321,24 @@ jobs:
       # CI has no registry access, so these must exit 0, write no proposal,
       # and leave the live catalogue unchanged.
       # ---------------------------------------------------------------------
+      #
+      # These modes reach the Ollama registry when it is available. To test
+      # the fail-soft path deterministically we must GUARANTEE no registry
+      # access — GitHub-hosted runners have open internet, so we cannot just
+      # assume it. The step below blackholes registry.ollama.ai and
+      # ollama.com to 127.0.0.1, so every curl to them fails fast
+      # (connection refused). With the registry unreachable the modes must
+      # exit 0, write no proposal, and leave the live catalogue unchanged.
+      # ---------------------------------------------------------------------
+      - name: 'Blackhole the Ollama registry (force offline for the next steps)'
+        run: |
+          echo "127.0.0.1 registry.ollama.ai" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 ollama.com"          | sudo tee -a /etc/hosts
+          # Confirm it is genuinely unreachable now.
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+            "https://registry.ollama.ai/v2/library/llama3.3/manifests/70b" || echo "000")
+          echo "registry probe after blackhole: $code (expect 000/failure)"
+
       - name: '--help mentions the catalogue-maintenance modes'
         run: |
           output=$(./llmstack-macos.sh --help)
@@ -362,6 +380,20 @@ jobs:
           diff -q "$cat" /tmp/catalog_before2 >/dev/null \
             || { echo "FAIL: live catalogue changed with no registry access"; exit 1; }
           echo "refresh-catalog-apply is offline-safe"
+
+      - name: '--refresh-catalog --discover is offline-safe (scrape fails soft)'
+        run: |
+          cat="$HOME/.config/llmstack/models.catalog"
+          cp "$cat" /tmp/catalog_before3
+          set +e
+          ./llmstack-macos.sh --refresh-catalog --discover >/dev/null 2>&1
+          rc=$?
+          [ "$rc" -eq 0 ] || { echo "FAIL: expected exit 0, got $rc"; exit 1; }
+          [ ! -f "${cat}.proposed" ] \
+            || { echo "FAIL: a proposal was written with no registry access"; exit 1; }
+          diff -q "$cat" /tmp/catalog_before3 >/dev/null \
+            || { echo "FAIL: live catalogue changed"; exit 1; }
+          echo "discover scrape is offline-safe and non-destructive"
 
   # ===========================================================================
   # macOS Tests — runs on Apple Silicon; tests real hardware detection
