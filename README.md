@@ -20,6 +20,7 @@ Inference, a web front-end, and private web search — all running locally, all 
 - [Options](#options)
 - [How models are chosen](#how-models-are-chosen)
 - [The model catalogue](#the-model-catalogue)
+- [Keeping the catalogue current](#keeping-the-catalogue-current)
 - [Startup behaviour, and one real limitation](#startup-behaviour-and-one-real-limitation)
 - [Remote SearXNG](#remote-searxng)
 - [Shell commands](#shell-commands)
@@ -93,6 +94,9 @@ Finally, turn on web search: **Admin → Settings → Web Search**, set *Enable*
 | `--status` | Print component health. Changes nothing. |
 | `--recommend` | Print detected hardware and suitable models. Installs nothing. |
 | `--uninstall` | Guided teardown, confirming every step. |
+| `--check-models` | Validate every catalogue tag against the Ollama registry and fix the VERIFIED column in place. |
+| `--refresh-catalog` | Write `models.catalog.proposed` — revalidated tags plus newer variants in your families. Never touches the live file. Add `--discover` to also scan for new families. |
+| `--refresh-catalog-apply` | As above, then replace the live catalogue after a backup and confirmation. Accepts `--discover`. |
 | `--version` | Print the script version and exit. |
 | `--help` | Full documentation. |
 
@@ -111,6 +115,9 @@ Every mode is safe to re-run. The installer checks state before acting and never
                        Skips the fit check.
 --no-model             Install the services without downloading a model.
 --no-drawthings        Skip Draw Things.
+--discover             With --refresh-catalog / --refresh-catalog-apply only:
+                       also scrape the Ollama library for new model families.
+                       Fail-soft — a failed scrape still yields a proposal.
 ```
 
 Ports are validated as integers in the range 1–65535; an invalid value is rejected before anything is installed. The script also checks for port conflicts before installing and warns if the target port is already in use, naming the process that holds it.
@@ -203,6 +210,42 @@ The script warns before pulling an unverified tag, and if the pull fails it poin
 | Coding | `qwen2.5-coder:32b-instruct`, `qwen2.5-coder:14b-instruct`, `qwen2.5-coder:7b-instruct` |
 | Vision | `llama3.2-vision:11b` |
 | MoE | `mixtral:8x7b` |
+
+### Keeping the catalogue current
+
+Model tags come and go — a tag that pulled last month can vanish when a
+family is renamed or reorganised. Three commands keep the catalogue honest,
+all built on the Ollama registry manifest endpoint (a live tag returns HTTP
+`200`, a missing tag `404`, no auth required):
+
+| Command | What it does |
+|---|---|
+| `--check-models` | Probes every catalogue tag. Corrects the VERIFIED column in place (`200` → `yes`, `404` → `no`) after backing up the file. Flags dead tags. |
+| `--refresh-catalog` | Writes `models.catalog.proposed` alongside the live file — never touching the live one. Re-validates every tag, comments out dead ones, and adds newer size variants found within your existing families. Review it, then `mv` it into place if you approve. |
+| `--refresh-catalog-apply` | Same, but replaces the live catalogue with the proposal after a backup and a confirmation prompt. |
+
+`--update` runs `--check-models` automatically, so a routine update also
+corrects the VERIFIED column and warns you about retired tags.
+
+**Discovery.** By default `--refresh-catalog` only looks *within* the model
+families already in your catalogue — the reliable path, since it never leaves
+the manifest API. Add `--discover` to also scrape `ollama.com/library` for
+*new* families you don't yet track. That scrape is the one fragile piece
+(HTML changes silently), so it is wholly fail-soft: if it fails, you still get
+a proposal built from validated tags and family variants, just without the
+newly-discovered families.
+
+**Everything here is fail-soft and offline-safe.** If the registry can't be
+reached, each command says so and changes nothing — which is also why they're
+safe to run in CI with no network access. Nothing ever reaches the catalogue
+without a manifest confirmation, so a broken scrape or a bad guess can't
+introduce a tag that doesn't exist.
+
+Every candidate — whether a variant probed within a family or a family found
+by discovery — is confirmed against the registry before it appears in the
+proposal, and lands with its judgment columns (`MIN_RAM`, `ROLE`, `SIZE`,
+`NOTES`) marked `REVIEW` for you to set. The tool finds and confirms; you
+still decide what belongs and how it's classified.
 
 ---
 
@@ -640,6 +683,16 @@ A few choices worth explaining, since they're the ones people tend to want to ch
 ---
 
 ## Changelog
+
+### v3.3.0
+
+- **Catalogue self-maintenance against the Ollama registry.** Three new modes keep model tags current without hand-editing:
+  - `--check-models` validates every catalogue tag (manifest `200`/`404`) and corrects the VERIFIED column in place after a backup.
+  - `--refresh-catalog` writes a reviewable `models.catalog.proposed`: revalidated tags, dead ones commented out, and newer size variants found within your existing families. The live catalogue is never touched.
+  - `--refresh-catalog-apply` applies that proposal after a backup and confirmation.
+- **`--discover` flag.** Layered onto the refresh modes, it additionally scrapes `ollama.com/library` for new model families. Fail-soft: a failed scrape still yields a proposal from validated tags and family variants.
+- **`--update` now auto-validates the catalogue.** The VERIFIED column is corrected and retired tags flagged as part of every routine update.
+- **All registry access is fail-soft.** If `registry.ollama.ai` is unreachable, every new command reports it and makes no change — safe offline and in CI. Every proposed candidate is manifest-confirmed before it appears, so a broken scrape or bad guess can never introduce a non-existent tag.
 
 ### v3.1.1
 
