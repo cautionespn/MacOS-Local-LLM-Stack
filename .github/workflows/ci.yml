@@ -371,6 +371,22 @@ jobs:
             exec /bin/df "$@"
           fi
           EOF
+          # Registry impersonator for the refresh tests only (kept out of
+          # fakebin so no other test sees it): 200 for tags in FAKE_LIVE,
+          # 404 for any other manifest, empty body for anything else.
+          mkdir -p "$RUNNER_TEMP/fakecurl"
+          cat > "$RUNNER_TEMP/fakecurl/curl" <<'EOF'
+          #!/bin/bash
+          url=""; for a in "$@"; do case "$a" in http*) url="$a" ;; esac; done
+          case "$url" in
+            *registry.ollama.ai/v2/library/*/manifests/*)
+              t="${url#*/v2/library/}"; tag="${t%%/manifests/*}:${t##*/manifests/}"
+              case " ${FAKE_LIVE:-} " in *" $tag "*) printf '200' ;; *) printf '404' ;; esac ;;
+            *) : ;;
+          esac
+          exit 0
+          EOF
+          chmod +x "$RUNNER_TEMP/fakecurl/curl"
           chmod +x "$RUNNER_TEMP/fakebin/sysctl" "$RUNNER_TEMP/fakebin/ioreg" \
             "$RUNNER_TEMP/fakebin/ollama" "$RUNNER_TEMP/fakebin/df"
 
@@ -462,6 +478,7 @@ jobs:
           called 'rm llama3.3:70b'; not_called 'rm qwen2.5:32b-instruct'; not_called 'rm nomic-embed-text:latest'
           not_called 'rm qwen3.8:27b'
           expect 'Embedding model'
+          reject 'Catalogue-Generation line|this script ships generation'
           # every pull must be logged before the first rm
           last_pull=$(grep -n '^pull ' "$RUNNER_TEMP/ollama.log" | tail -1 | cut -d: -f1)
           first_rm=$(grep -n '^rm ' "$RUNNER_TEMP/ollama.log" | head -1 | cut -d: -f1)
@@ -490,25 +507,49 @@ jobs:
           ! grep -qE '^(pull|rm) ' "$RUNNER_TEMP/ollama.log" || { echo "FAIL: pull or rm was called"; exit 1; }
           echo "ok   no pull or rm"
 
-      - name: 'Sync: stale catalogue is replaced only on yes, with a backup'
+      - name: 'Sync: catalogue without a generation marker is replaced only on yes'
         run: |
           . "$RUNNER_TEMP/simulate.sh"
+          # deepthought's real case: Last-Updated is TODAY but there is no
+          # Catalogue-Generation marker, so the date alone must not suppress the offer.
           old="$RUNNER_TEMP/old.catalog"
-          printf '%s\n' '# Last-Updated: 2026-08-09' '8|qwen2.5:7b-instruct|5|dense|daily|yes|old' > "$old"
-          export FAKE_OLLAMA_MODELS="qwen2.5:7b-instruct"
-          label="stale, answer no"; sync 'Apple M4 Pro' 12 64 'n n' "$old"
-          expect 'dated 2026-08-09'
-          grep -q '^# Last-Updated: 2026-08-09' "$SYNC_HOME/.config/llmstack/models.catalog" \
+          printf '%s\n' '# Last-Updated: 2026-09-30' '32|qwen3.6:35b-a3b|24|moe|daily|yes|old' > "$old"
+          export FAKE_OLLAMA_MODELS="qwen3.6:35b-a3b"
+          label="no marker, answer no"; sync 'Apple M4 Pro' 12 64 'n' "$old"
+          expect 'no Catalogue-Generation line'
+          ! grep -q '^# Catalogue-Generation:' "$SYNC_HOME/.config/llmstack/models.catalog" \
             || { echo "FAIL: catalogue changed despite no"; exit 1; }
           echo "ok   [$label] catalogue unchanged"
-          # yes to refresh, then decline all pulls and the removal
-          label="stale, answer yes"; sync 'Apple M4 Pro' 12 64 'y n n n n' "$old"
-          grep -q '^# Last-Updated: 2026-09-30' "$SYNC_HOME/.config/llmstack/models.catalog" \
+          # yes to replace, then decline the three new pulls; nothing to remove
+          label="no marker, answer yes"; sync 'Apple M4 Pro' 12 64 'y n n n' "$old"
+          grep -q '^# Catalogue-Generation: ' "$SYNC_HOME/.config/llmstack/models.catalog" \
             || { echo "FAIL: catalogue not replaced"; exit 1; }
           ls "$SYNC_HOME"/.config/llmstack/models.catalog.backup-* >/dev/null \
             || { echo "FAIL: no backup written"; exit 1; }
-          expect 'qwen3.6:35b-a3b'
+          expect 'qwen3.8:27b'
           echo "ok   [$label] replaced, backup kept, new picks shown"
+
+      - name: 'Sync: older generation is offered, current generation is not'
+        run: |
+          . "$RUNNER_TEMP/simulate.sh"
+          export FAKE_OLLAMA_MODELS="qwen3.6:35b-a3b"
+          older="$RUNNER_TEMP/older.catalog"
+          printf '%s\n' '# Last-Updated: 2026-09-30' '# Catalogue-Generation: 3.3.0' '32|qwen3.6:35b-a3b|24|moe|daily|yes|x' > "$older"
+          label="generation 3.3.0"; sync 'Apple M4 Pro' 12 64 'n' "$older"
+          expect 'is generation 3.3.0'
+          gen=$(grep -m1 '^CATALOG_GENERATION=' llmstack-macos.sh | cut -d'"' -f2)
+          current="$RUNNER_TEMP/current.catalog"
+          printf '%s\n' '# Last-Updated: 2020-01-01' "# Catalogue-Generation: $gen" '32|qwen3.6:35b-a3b|24|moe|daily|yes|x' > "$current"
+          label="generation $gen (old date)"; sync 'Apple M4 Pro' 12 64 '' "$current"
+          reject 'Catalogue-Generation line|this script ships generation'
+          label="--recommend notes an old catalogue"; out="$(simulate 'Apple M4 Pro' 12 64 '' "$older")"
+          expect 'predates the generation'
+          # Regression (v3.5.1): a catalogue with no Last-Updated line used to make
+          # --recommend exit silently under set -euo pipefail.
+          nodate="$RUNNER_TEMP/nodate.catalog"
+          printf '%s\n' '32|qwen3.6:35b-a3b|24|moe|daily|yes|x' > "$nodate"
+          label="--recommend with no Last-Updated line"; out="$(simulate 'Apple M4 Pro' 12 64 '' "$nodate")"
+          expect 'daily: +qwen3.6:35b-a3b$'; expect 'no readable .Last-Updated'
 
       - name: 'Sync: disk shortfall stops before any pull'
         run: |
@@ -526,6 +567,61 @@ jobs:
           . "$RUNNER_TEMP/simulate.sh"
           label="recommend pointer"; out="$(simulate 'Apple M4 Pro' 12 64 '')"
           expect '--sync-models'
+
+      # ---------------------------------------------------------------------
+      # Catalogue refresh against a stub registry (v3.5.1)
+      # ---------------------------------------------------------------------
+      - name: 'Refresh: order kept, dead rows commented in place, suggestions only as # REVIEW'
+        run: |
+          h="$(mktemp -d)"; mkdir -p "$h/.config/llmstack"; c="$h/.config/llmstack/models.catalog"
+          printf '%s\n' '# Last-Updated: 2026-01-01' '# Catalogue-Generation: 3.4.0' \
+            '# --- Daily ---' '32|qwen3.6:35b-a3b|23|moe|daily|yes|kept' \
+            '# --- Coding ---' '16|qwen3.6:14b|9|dense|coding|no|dead one' > "$c"
+          export FAKE_LIVE="llama3.3:70b qwen3.6:35b-a3b qwen3.6:27b"
+          run() { HOME="$h" PATH="$RUNNER_TEMP/fakecurl:$PATH" ./llmstack-macos.sh "$@"; }
+          run --refresh-catalog
+          p="$c.proposed"; cat -n "$p"
+          [ "$(awk '/^# --- Daily ---/ { getline; print }' "$p")" = '32|qwen3.6:35b-a3b|23|moe|daily|yes|kept' ] \
+            || { echo "FAIL: live row no longer under its heading"; exit 1; }
+          awk '/^# --- Coding ---/ { getline; print }' "$p" | grep -q '^# DEAD (404.*qwen3\.6:14b' \
+            || { echo "FAIL: dead row not commented in place"; exit 1; }
+          grep -q '^# REVIEW: REVIEW|qwen3\.6:27b|' "$p" || { echo "FAIL: candidate not suggested"; exit 1; }
+          ! grep -qE '^REVIEW\|' "$p" || { echo "FAIL: an unreviewed row is live"; exit 1; }
+          grep -qx '# Last-Updated: 2026-01-01' "$p" || { echo "FAIL: proposal changed Last-Updated"; exit 1; }
+          echo "ok   order, dead-in-place, REVIEW-as-comment, date untouched"
+          # adopt the proposal verbatim and refresh again: no duplicate suggestion
+          mv "$p" "$c"; run --refresh-catalog
+          [ "$(grep -c '^# REVIEW: REVIEW|qwen3\.6:27b|' "$c.proposed")" -eq 1 ] \
+            || { echo "FAIL: suggestion duplicated on second refresh"; exit 1; }
+          [ "$(grep -c '^# --- Suggested by --refresh-catalog' "$c.proposed")" -eq 1 ] \
+            || { echo "FAIL: suggestion header duplicated"; exit 1; }
+          echo "ok   second refresh adds no duplicates"
+
+      - name: 'Refresh apply: Last-Updated set to today only on yes'
+        run: |
+          h="$(mktemp -d)"; mkdir -p "$h/.config/llmstack"; c="$h/.config/llmstack/models.catalog"
+          printf '%s\n' '# Last-Updated: 2026-01-01' '32|qwen3.6:35b-a3b|23|moe|daily|yes|kept' > "$c"
+          export FAKE_LIVE="llama3.3:70b qwen3.6:35b-a3b"
+          run() { HOME="$h" PATH="$RUNNER_TEMP/fakecurl:$PATH" ./llmstack-macos.sh "$@"; }
+          printf 'n\n' | run --refresh-catalog-apply
+          grep -qx '# Last-Updated: 2026-01-01' "$c" || { echo "FAIL: date changed on no"; exit 1; }
+          printf 'y\n' | run --refresh-catalog-apply
+          grep -qx "# Last-Updated: $(date +%Y-%m-%d)" "$c" || { echo "FAIL: date not stamped on yes"; exit 1; }
+          [ ! -f "$c.proposed" ] || { echo "FAIL: applied proposal left behind"; exit 1; }
+          echo "ok   date stamped only on confirmed apply"
+
+      - name: 'Refresh apply: a leftover proposal is never applied when offline'
+        run: |
+          h="$(mktemp -d)"; mkdir -p "$h/.config/llmstack"; c="$h/.config/llmstack/models.catalog"
+          printf '%s\n' '# Last-Updated: 2026-01-01' '32|qwen3.6:35b-a3b|23|moe|daily|yes|kept' > "$c"
+          printf '%s\n' '# stale leftover' '8|bogus:1b|1|dense|daily|yes|x' > "$c.proposed"
+          cp "$c" "$RUNNER_TEMP/before.catalog"
+          # A curl that always fails: the registry is unreachable.
+          mkdir -p "$RUNNER_TEMP/deadcurl"; printf '#!/bin/bash\nexit 7\n' > "$RUNNER_TEMP/deadcurl/curl"
+          chmod +x "$RUNNER_TEMP/deadcurl/curl"
+          printf 'y\n' | HOME="$h" PATH="$RUNNER_TEMP/deadcurl:$PATH" ./llmstack-macos.sh --refresh-catalog-apply
+          diff -q "$c" "$RUNNER_TEMP/before.catalog" >/dev/null || { echo "FAIL: leftover proposal was applied"; exit 1; }
+          echo "ok   leftover proposal ignored"
 
       # ---------------------------------------------------------------------
       # Live tag guard (replaces the old static "fictional tag" blocklist,

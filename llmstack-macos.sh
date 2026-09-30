@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# llmstack-macos.sh  v3.5.0
+# llmstack-macos.sh  v3.5.1
 #
 # A self-contained, private LLM stack for macOS on Apple Silicon.
 #
@@ -22,8 +22,13 @@ set -euo pipefail
 # Constants
 # ---------------------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="3.5.0"
+SCRIPT_VERSION="3.5.1"
 CATALOG_DATE="2026-09-30"
+# The script version in which the built-in catalogue rows last changed.
+# Written into every built-in catalogue; --sync-models offers to replace a
+# live catalogue whose marker is missing or older. Bump it only when the
+# rows in write_default_catalog change.
+CATALOG_GENERATION="3.4.0"
 CATALOG_WARN_DAYS=90
 CATALOG_STALE_DAYS=180
 
@@ -227,6 +232,13 @@ write_default_catalog() {
 # ===========================================================================
 #
 # Last-Updated: ${CATALOG_DATE}
+# Catalogue-Generation: ${CATALOG_GENERATION}
+#
+# Last-Updated is when a person last reviewed this file; the script grades
+# staleness from it. Catalogue-Generation records which built-in catalogue
+# this file descends from; --sync-models offers to replace the file when
+# the script ships a newer generation. If you maintain your own catalogue,
+# keep the Catalogue-Generation line current to stop that offer.
 #
 # Local model releases move quickly. Treat this file as a starting point,
 # not an authority, and revise it as new models appear. When you do, update
@@ -293,9 +305,33 @@ ensure_catalog() {
   fi
 }
 
+# These lookups feed $(...) assignments, and under `set -o pipefail` a grep
+# that matches nothing fails the whole pipeline, which `set -e` then turns
+# into a silent exit. "Not found" is a normal answer here, so they always
+# succeed and print nothing instead.
 catalog_date() {
   [ -f "$CATALOG" ] || return 0
-  grep -m1 '^# Last-Updated:' "$CATALOG" 2>/dev/null | awk '{print $3}'
+  grep -m1 '^# Last-Updated:' "$CATALOG" 2>/dev/null | awk '{print $3}' || true
+}
+
+catalog_generation() {
+  [ -f "$CATALOG" ] || return 0
+  grep -m1 '^# Catalogue-Generation:' "$CATALOG" 2>/dev/null | awk '{print $3}' || true
+}
+
+# True if dotted version $1 is older than $2 (e.g. 3.3.0 < 3.4.0).
+_version_lt() {
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    n = split(a, x, "."); m = split(b, y, "."); k = (n > m) ? n : m
+    for (i = 1; i <= k; i++) { if (x[i] + 0 < y[i] + 0) exit 0; if (x[i] + 0 > y[i] + 0) exit 1 }
+    exit 1 }'
+}
+
+# True when the live catalogue does not descend from the current built-in
+# generation: its marker is missing or older.
+catalog_predates_builtin() {
+  local gen; gen="$(catalog_generation)"
+  [ -z "$gen" ] || _version_lt "$gen" "$CATALOG_GENERATION"
 }
 
 # Portable date-to-epoch: tries macOS date -j first, then GNU date -d.
@@ -402,14 +438,14 @@ catalog_families() {
   [ -f "$CATALOG" ] || return 0
   grep -v '^#' "$CATALOG" | grep -v '^$' \
     | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/,"",$2); split($2,a,":"); print a[1]}' \
-    | sort -u
+    | sort -u || true
 }
 
 # All tags currently in the catalogue, one per line, trimmed.
 catalog_tags() {
   [ -f "$CATALOG" ] || return 0
   grep -v '^#' "$CATALOG" | grep -v '^$' \
-    | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}'
+    | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' || true
 }
 
 # ---------------------------------------------------------------------------
@@ -520,13 +556,21 @@ discover_new_families() {
 
 # ---------------------------------------------------------------------------
 # Part B/C core: build models.catalog.proposed next to the live file.
-#   - Re-validates every existing tag (SIZE/VERIFIED updated, all judgment
-#     columns MIN_RAM/ARCH/ROLE/NOTES preserved; dead tags commented out).
-#   - Appends B-lite family variants as REVIEW rows (VERIFIED=yes, but
-#     MIN_RAM/ROLE/NOTES marked REVIEW for the human to set).
-#   - With $1 = "discover", also appends B-full discovered families.
-# Never touches the live catalogue. Echoes the proposal path. Returns 0.
+#   - Walks the live file IN ORDER. Comments and blank lines pass through
+#     untouched, so section headings keep their rows. (Up to v3.5.0 every
+#     comment was hoisted to the top, and each refresh degraded the file.)
+#   - Re-validates every data row in place: VERIFIED corrected, judgment
+#     columns MIN_RAM/ARCH/ROLE/NOTES preserved, dead tags commented out.
+#   - New candidates (family variants; with $1 = "discover", new families)
+#     are appended as commented "# REVIEW:" lines, never as live rows, and
+#     a candidate already suggested that way is not suggested again.
+#   - Leaves Last-Updated alone: that line records human review, which a
+#     proposal is not. apply_catalog_proposal stamps it on confirmation.
+# Never touches the live catalogue. Returns 0.
 # ---------------------------------------------------------------------------
+REVIEW_HEADER="# --- Suggested by --refresh-catalog: set every REVIEW field, then delete '# REVIEW: ' ---"
+PROPOSAL_BUILT="no"
+
 build_catalog_proposal() {
   local discover="${1:-no}"
   ensure_catalog
@@ -538,16 +582,11 @@ build_catalog_proposal() {
   fi
   log "Building a catalogue proposal (live file is not touched)"
   local tmp; tmp="$(mktemp)"
-  # 1) header, with a refreshed date
-  {
-    grep '^#' "$CATALOG" | sed "s/^# Last-Updated:.*/# Last-Updated: $(date +%Y-%m-%d)/"
-    echo ""
-  } > "$tmp"
-  # 2) re-validate existing entries
-  local live=0 dead=0
-  while IFS= read -r rawline; do
-    case "$rawline" in '#'*|'') continue ;; esac
-    local ram tag size arch role ver notes trimtag status
+  local live=0 dead=0 added=0 rawline ram tag size arch role ver notes trimtag status
+  while IFS= read -r rawline || [ -n "$rawline" ]; do
+    case "$rawline" in
+      '#'*|'') printf '%s\n' "$rawline" >> "$tmp"; continue ;;
+    esac
     IFS='|' read -r ram tag size arch role ver notes <<< "$rawline"
     trimtag="$(_trim "$tag")"
     status="$(registry_probe "$trimtag")"
@@ -563,56 +602,62 @@ build_catalog_proposal() {
         printf '%s|%s|%s|%s|%s|%s|%s\n' "$ram" "$trimtag" "$size" "$arch" "$role" "$(_trim "$ver")" "$notes" >> "$tmp" ;;
     esac
   done < "$CATALOG"
-  # 3) B-lite family variants
-  local variants added=0
-  variants="$(probe_family_variants)"
-  if [ -n "$variants" ]; then
-    printf '# --- Proposed variants (B-lite; set MIN_RAM/ROLE/NOTES) ---\n' >> "$tmp"
-    while IFS= read -r cand; do
-      [ -n "$cand" ] || continue
-      printf 'REVIEW|%s|REVIEW|dense|daily|yes|REVIEW - confirmed in registry, set MIN_RAM/ROLE/SIZE.\n' "$cand" >> "$tmp"
-      added=$((added+1))
-    done <<< "$variants"
-  fi
-  # 4) B-full discovery (optional)
+
+  local cands="" fams fam cand
+  cands="$(probe_family_variants)"
   if [ "$discover" = "discover" ]; then
-    local fams
     fams="$(discover_new_families)"
-    if [ -n "$fams" ]; then
-      printf '# --- Discovered families (B-full; unverified sizing) ---\n' >> "$tmp"
-      while IFS= read -r fam; do
-        [ -n "$fam" ] || continue
-        printf 'REVIEW|%s:latest|REVIEW|dense|daily|yes|REVIEW - new family from library scrape.\n' "$fam" >> "$tmp"
-        added=$((added+1))
-      done <<< "$fams"
-    fi
+    while IFS= read -r fam; do
+      [ -n "$fam" ] && cands="${cands}"$'\n'"${fam}:latest"
+    done <<< "$fams"
   fi
+  while IFS= read -r cand; do
+    [ -n "$cand" ] || continue
+    # Suggested by an earlier refresh and not yet acted on: don't repeat it.
+    grep -qF "# REVIEW: REVIEW|${cand}|" "$CATALOG" && continue
+    grep -qxF "$REVIEW_HEADER" "$tmp" || printf '%s\n' "$REVIEW_HEADER" >> "$tmp"
+    printf '# REVIEW: REVIEW|%s|REVIEW|REVIEW|REVIEW|yes|Confirmed in the registry. Set MIN_RAM, SIZE, ARCH, ROLE and NOTES.\n' \
+      "$cand" >> "$tmp"
+    added=$((added+1))
+  done <<< "$cands"
+
   mv "$tmp" "$proposed"
+  PROPOSAL_BUILT="yes"
   printf '\n'
   ok "Wrote proposal: $proposed"
-  printf 'Summary: %d live, %d dead, %d new candidate(s) added for review.\n' "$live" "$dead" "$added"
-  printf '\nReview it, then compare against the live file:\n'
+  printf 'Summary: %d live, %d dead, %d new suggestion(s) added as "# REVIEW:" comments.\n' "$live" "$dead" "$added"
+  printf '\nSuggestions never become live rows on their own: set every REVIEW\n'
+  printf 'field and delete the leading "# REVIEW: " to adopt one.\n'
+  printf '\nCompare against the live file:\n'
   printf '  diff "%s" "%s"\n' "$CATALOG" "$proposed"
-  printf 'If you approve, replace the live catalogue:\n'
+  printf 'Apply it with --refresh-catalog-apply, or by hand:\n'
   printf '  mv "%s" "%s"\n\n' "$proposed" "$CATALOG"
   return 0
 }
 
 # ---------------------------------------------------------------------------
 # Part C: apply the proposal over the live catalogue, after backup + confirm.
+# Only a proposal built in this run is applied: a leftover .proposed file
+# from an earlier run (e.g. when the registry is now unreachable) is not.
+# Confirming the diff is a human review, so Last-Updated is stamped here.
 # ---------------------------------------------------------------------------
 apply_catalog_proposal() {
   local discover="${1:-no}"
   build_catalog_proposal "$discover"
   local proposed="${CATALOG}.proposed"
-  [ -f "$proposed" ] || { warn "No proposal to apply."; return 0; }
+  if [ "$PROPOSAL_BUILT" != "yes" ] || [ ! -f "$proposed" ]; then
+    warn "No new proposal was built, so nothing was applied."
+    return 0
+  fi
   printf '\n'
   diff "$CATALOG" "$proposed" || true
   printf '\n'
   if confirm "Replace the live catalogue with this proposal?"; then
     cp "$CATALOG" "${CATALOG}.backup-$(date +%Y%m%d-%H%M%S)"
-    mv "$proposed" "$CATALOG"
-    ok "Catalogue updated. Backup kept alongside it."
+    sed "s/^# Last-Updated:.*/# Last-Updated: $(date +%Y-%m-%d)/" "$proposed" > "${proposed}.dated"
+    mv "${proposed}.dated" "$CATALOG"
+    rm -f "$proposed"
+    ok "Catalogue updated and Last-Updated set to today. Backup kept alongside it."
   else
     log "Left the live catalogue unchanged. Proposal remains at $proposed"
   fi
@@ -757,6 +802,8 @@ best_for_role() {
       gsub(/^[ \t]+|[ \t]+$/, "", $2)
       gsub(/^[ \t]+|[ \t]+$/, "", $4)
       gsub(/^[ \t]+|[ \t]+$/, "", $5)
+      # Unreviewed rows (e.g. MIN_RAM or SIZE still "REVIEW") are never picked.
+      if ($1 !~ /^[0-9.]+$/ || $3 !~ /^[0-9.]+$/) next
       if ($4 == "dense" && cap != "" && ($3 + 0) > (cap + 0)) next
       if ($5 == want && ($1 + 0) <= ram && ($3 + 0) <= budget && ($3 + 0) > best) {
         best = $3 + 0
@@ -864,6 +911,11 @@ SYSINFO2
   report_catalog_age
   printf 'Catalogue file: %s\n' "$CATALOG"
   printf 'Edit it to change these recommendations.\n'
+  if catalog_predates_builtin; then
+    printf '\nYour catalogue predates the generation %s catalogue built into this\n' "$CATALOG_GENERATION"
+    printf 'script, so newer models are not considered. --sync-models offers to\n'
+    printf 'replace it (with a backup).\n'
+  fi
   printf 'To pull these picks and review removal of other installed models:\n'
   printf '  %s --sync-models\n\n' "$SCRIPT_NAME"
 }
@@ -926,8 +978,9 @@ MODES
                     it, then exit. Installs nothing. Useful before
                     committing to a large download.
     --sync-models   Bring installed models in line with the
-                    recommendations. Offers to refresh an out-of-date
-                    catalogue, asks which missing picks to pull, pulls
+                    recommendations. Offers to replace a catalogue whose
+                    Catalogue-Generation marker is missing or older than
+                    the built-in one, asks which missing picks to pull, pulls
                     them, and only then offers each installed model that
                     is not a current pick for removal, one at a time.
                     Every prompt defaults to no. Needs Ollama running.
@@ -938,15 +991,17 @@ MODES
                     registry and correct the VERIFIED column in place.
                     Read-only network probe; changes only that column.
     --refresh-catalog
-                    Write models.catalog.proposed: re-validate every tag,
-                    comment out dead ones, and add newer variants found
-                    within your existing model families. Never touches the
-                    live catalogue. Add --discover to also scan the Ollama
-                    library for entirely new model families.
+                    Write models.catalog.proposed: re-validate every tag in
+                    place, comment out dead ones, and suggest newer variants
+                    within your existing families as "# REVIEW:" comments,
+                    which never become live rows until you edit them in.
+                    Never touches the live catalogue or its Last-Updated
+                    line. Add --discover to also scan the Ollama library
+                    for entirely new model families.
     --refresh-catalog-apply
                     As --refresh-catalog, then replace the live catalogue
-                    with the proposal after a backup and confirmation.
-                    Accepts --discover.
+                    with the proposal after a backup and confirmation,
+                    setting Last-Updated to today. Accepts --discover.
     --version       Print the script version and exit.
     --help          Show this text and exit.
 OPTIONS
@@ -1034,6 +1089,12 @@ KEEPING THE CATALOGUE CURRENT
       --check-models        validate existing tags, fix the VERIFIED column
       --refresh-catalog     write a reviewed proposal (never the live file)
       --refresh-catalog-apply   apply that proposal after backup + confirm
+    The catalogue header carries two lines. Last-Updated is when a person
+    last reviewed the file; it drives the staleness grading and changes
+    only when you edit it or confirm --refresh-catalog-apply.
+    Catalogue-Generation records which built-in catalogue the file
+    descends from; --sync-models uses it to offer a replacement when this
+    script ships newer rows.
     --update runs the validation step automatically. All of these are
     fail-soft: if the registry cannot be reached, they report that and make
     no changes, so they are safe to run offline and in CI.
@@ -1435,7 +1496,7 @@ _is_embedding_model() {
 }
 
 sync_models() {
-  local listing inst="" m live_date role line rows="" picks picktags sel="" cands=""
+  local listing inst="" m gen role line rows="" picks picktags sel="" cands=""
   local tag size arch roles st need sz pulled="" failed="" removed="" kept=""
   detect_system
   ensure_catalog
@@ -1460,13 +1521,24 @@ SYNCHDR
 $(printf '%s\n' "$listing" | awk 'NR > 1 && NF { print $1 }')
 EOF_LIST
 
-  # 2. An older live catalogue hides newer models from the picks.
-  live_date="$(catalog_date)"
-  if [ -n "$live_date" ] && [[ "$live_date" < "$CATALOG_DATE" ]]; then
-    printf '\nYour model catalogue is dated %s; this script ships one dated %s.\n' "$live_date" "$CATALOG_DATE"
+  # 2. A catalogue that does not descend from the current built-in one
+  # hides newer models from the picks. Judged by the Catalogue-Generation
+  # marker, not Last-Updated: that date records review, and refresh tooling
+  # before v3.5.1 stamped it on every proposal.
+  if catalog_predates_builtin; then
+    gen="$(catalog_generation)"
+    if [ -z "$gen" ]; then
+      printf '\nYour model catalogue has no Catalogue-Generation line, so it predates\n'
+      printf 'the generation %s catalogue built into this script, or was built by hand.\n' "$CATALOG_GENERATION"
+    else
+      printf '\nYour model catalogue is generation %s; this script ships generation %s.\n' "$gen" "$CATALOG_GENERATION"
+    fi
     echo "    Picks come from your catalogue, so newer models will not appear"
-    echo "    until it is refreshed. Replacing it keeps a timestamped backup;"
+    echo "    until it is replaced. Replacing it keeps a timestamped backup;"
     echo "    copy any rows you added by hand back from that file afterwards."
+    echo "    If you maintain your own catalogue on purpose, answer no and add"
+    echo "    this line to it to stop being asked:"
+    echo "      # Catalogue-Generation: $CATALOG_GENERATION"
     if confirm "Back up your catalogue and replace it with the built-in one?"; then
       cp "$CATALOG" "${CATALOG}.backup-$(date +%Y%m%d-%H%M%S)"
       write_default_catalog
