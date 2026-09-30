@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# llmstack-macos.sh  v3.5.1
+# llmstack-macos.sh  v3.6.0
 #
 # A self-contained, private LLM stack for macOS on Apple Silicon.
 #
@@ -22,7 +22,7 @@ set -euo pipefail
 # Constants
 # ---------------------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="3.5.1"
+SCRIPT_VERSION="3.6.0"
 CATALOG_DATE="2026-09-30"
 # The script version in which the built-in catalogue rows last changed.
 # Written into every built-in catalogue; --sync-models offers to replace a
@@ -980,7 +980,9 @@ MODES
     --sync-models   Bring installed models in line with the
                     recommendations. Offers to replace a catalogue whose
                     Catalogue-Generation marker is missing or older than
-                    the built-in one, asks which missing picks to pull, pulls
+                    the built-in one, asks which missing picks to pull and
+                    which installed picks to update (their build is older
+                    than the registry's), pulls
                     them, and only then offers each installed model that
                     is not a current pick for removal, one at a time.
                     Every prompt defaults to no. Needs Ollama running.
@@ -1495,9 +1497,31 @@ _is_embedding_model() {
     | grep -qi 'embedding'
 }
 
+# SHA-256 of a file (macOS shasum, or sha256sum elsewhere).
+_sha256() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1"; else sha256sum "$1"; fi | awk '{ print $1 }'
+}
+
+# The ID `ollama list` shows for a model is the first 12 hex digits of the
+# SHA-256 of its local manifest, and the registry serves that manifest byte
+# for byte (both verified on a real install, v3.6.0). So an installed build
+# is outdated exactly when its ID differs from the SHA-256 of the manifest
+# the registry now serves - one small request, no download.
+# Echoes those 12 digits, or nothing if the manifest could not be fetched.
+_registry_manifest_id() {
+  local t="$1" f
+  f="$(mktemp)"
+  if curl -s -f --max-time 15 -H "Accept: ${REGISTRY_ACCEPT}" \
+       "${REGISTRY_BASE}/${t%%:*}/manifests/${t##*:}" -o "$f" 2>/dev/null && [ -s "$f" ]; then
+    _sha256 "$f" | cut -c1-12
+  fi
+  rm -f "$f"
+}
+
 sync_models() {
   local listing inst="" m gen role line rows="" picks picktags sel="" cands=""
-  local tag size arch roles st need sz pulled="" failed="" removed="" kept=""
+  local tag size arch roles st need sz pulled="" updated="" failed="" removed="" kept=""
+  local states="" reachable="no" lid rid kind
   detect_system
   ensure_catalog
   cat <<'SYNCHDR'
@@ -1566,20 +1590,47 @@ EOF_LIST
   fi
   picktags="$(printf '%s\n' "$picks" | cut -d'|' -f1)"
 
+  # An installed pick may be an old build of its tag: compare manifest
+  # digests with the registry (one reachability probe first, so an offline
+  # machine does not wait out a timeout per pick). Fail-soft: unreachable
+  # means "unchecked", never an error.
+  if registry_reachable; then reachable="yes"; fi
   printf '\nCurrent picks for this machine (%s GB, %s):\n' "$SYS_RAM_GB" "$SYS_CHIP"
   while IFS='|' read -r tag size arch roles; do
     [ -n "$tag" ] || continue
-    if _has_line "$inst" "$tag"; then st="installed"; else st="not installed"; fi
+    if ! _has_line "$inst" "$tag"; then
+      st="not installed"
+    elif [ "$reachable" != "yes" ]; then
+      st="unchecked"
+    else
+      lid="$(printf '%s\n' "$listing" | awk -v m="$tag" 'NR > 1 { n = $1; if (n !~ /:/) n = n ":latest"; if (n == m) { print $2; exit } }')"
+      rid="$(_registry_manifest_id "$tag")"
+      if [ -z "$rid" ] || [ -z "$lid" ]; then st="unchecked"
+      elif [ "$rid" = "$lid" ]; then st="current"
+      else st="outdated"
+      fi
+    fi
+    states="${states}${tag}|${st}"$'\n'
     printf '  %-30s %6s GB  %-5s  %-13s  %s\n' "$tag" "$size" "$arch" "$st" "$roles"
   done <<< "$picks"
+  if [ "$reachable" != "yes" ]; then
+    printf '  (Registry unreachable: installed picks were not checked for newer builds.)\n'
+  fi
 
-  # 4. Choose which missing picks to pull.
+  # 4. Choose which missing picks to pull and which outdated ones to update.
   while IFS='|' read -r tag size arch roles <&3; do
     [ -n "$tag" ] || continue
-    _has_line "$inst" "$tag" && continue
-    if confirm "Pull $tag (about $size GB) for: $roles?"; then
-      sel="${sel}${tag}|${size}"$'\n'
-    fi
+    st="$(printf '%s' "$states" | awk -F'|' -v t="$tag" '$1 == t { print $2; exit }')"
+    case "$st" in
+      "not installed")
+        if confirm "Pull $tag (about $size GB) for: $roles?"; then
+          sel="${sel}${tag}|${size}|pull"$'\n'
+        fi ;;
+      outdated)
+        if confirm "Update $tag for: $roles? Your build is older than the registry's (download up to $size GB)."; then
+          sel="${sel}${tag}|${size}|update"$'\n'
+        fi ;;
+    esac
   done 3<<< "$picks"
 
   # Removal candidates: installed, and not any role's current pick. A pick
@@ -1590,12 +1641,14 @@ EOF_LIST
   done <<< "$inst"
 
   if [ -z "$sel" ] && [ -z "$cands" ]; then
-    printf '\nNothing to do: no pulls chosen and no other models installed.\n\n'
+    printf '\nNothing to do: no pulls or updates chosen and no other models installed.\n\n'
     exit 0
   fi
 
   # 5. Old and new models coexist until the removals, so check up front.
   if [ -n "$sel" ]; then
+    # Updates count at full size: Ollama fetches the new layers before it
+    # drops the old ones.
     need="$(printf '%s' "$sel" | awk -F'|' 'NF { s += $2 } END { printf "%d", s + 10.999 }')"
     if awk -v f="$SYS_DISK_FREE_GB" -v w="$need" 'BEGIN { exit !(f + 0 < w + 0) }'; then
       warn "Only ${SYS_DISK_FREE_GB} GB free; the chosen downloads need about ${need} GB including 10 GB headroom."
@@ -1608,11 +1661,15 @@ EOF_LIST
   # 6. Pull everything chosen before removing anything.
   if [ -n "$sel" ]; then
     trap 'warn "Pull interrupted. Nothing was removed. Re-run to resume the download."; exit 1' INT
-    while IFS='|' read -r tag size <&3; do
+    while IFS='|' read -r tag size kind <&3; do
       [ -n "$tag" ] || continue
       log "Pulling $tag (about $size GB). Large downloads take a while."
       if ollama pull "$tag"; then
-        pulled="${pulled}${tag}"$'\n'
+        if [ "$kind" = "update" ]; then
+          updated="${updated}${tag}"$'\n'
+        else
+          pulled="${pulled}${tag}"$'\n'
+        fi
         ok "Pulled $tag"
       else
         failed="${failed}${tag}"$'\n'
@@ -1662,6 +1719,7 @@ EOF_LIST
 ===========================================================================
 SYNCDONE
   printf '  Pulled:\n';  if [ -n "$pulled" ];  then printf '%s' "$pulled"  | sed 's/^/    /'; else echo "    (none)"; fi
+  printf '  Updated:\n'; if [ -n "$updated" ]; then printf '%s' "$updated" | sed 's/^/    /'; else echo "    (none)"; fi
   printf '  Removed:\n'; if [ -n "$removed" ]; then printf '%s' "$removed" | sed 's/^/    /'; else echo "    (none)"; fi
   printf '  Kept, not a current pick:\n'; if [ -n "$kept" ]; then printf '%s' "$kept" | sed 's/^/    /'; else echo "    (none)"; fi
   if [ -n "$removed" ]; then

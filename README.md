@@ -422,11 +422,17 @@ The block is delimited by start and end markers. Re-running the installer **repl
 `--recommend` tells you what suits the machine; `--sync-models` makes the installed models match it. With Ollama running, it:
 
 1. **Offers to replace an out-of-date catalogue.** If your catalogue's `Catalogue-Generation` marker is missing or older than the script's, it explains why and offers to back it up and replace it. The date line plays no part in this.
-2. **Shows the current picks**, each with its roles, size, and whether it's already installed.
-3. **Asks which missing picks to pull**, once per model. A model serving several roles is asked about once.
+2. **Shows the current picks**, each with its roles, size and state:
+   - `not installed`
+   - `current`: installed, and the same build the registry serves
+   - `outdated`: installed, but an older build of that tag
+   - `unchecked`: installed, but the registry couldn't be reached
+3. **Asks which missing picks to pull and which outdated ones to update**, once per model. A model serving several roles is asked about once.
 4. **Checks free disk** against the chosen downloads plus 10 GB of headroom, and stops with nothing changed if it's short.
 5. **Pulls everything you chose.** If any pull fails, nothing is removed.
 6. **Only then offers each other installed model for removal, one at a time.** Embedding models get an explicit warning, because Open WebUI may use them for document search.
+
+**How "outdated" is detected.** The ID `ollama list` shows is the start of the SHA-256 of the model's local manifest, and the registry serves that manifest byte for byte. If the digest of the registry's current manifest differs from your ID, a newer build has been published under the same tag. Checking takes one small request per pick, with no download. This matters because tags move: a `qwen3.6:35b-a3b` pulled seven weeks earlier had different weights from the one Ollama now serves. It also stopped sharing weights with the `-coding` tag, costing a second 22 GB copy until it was updated.
 
 Every prompt defaults to no, so pressing Enter never downloads or deletes anything. A pick you decline to pull is never offered for removal — it's still a recommendation.
 
@@ -788,6 +794,14 @@ A few choices worth explaining, since they're the ones people tend to want to ch
 ---
 
 ## Changelog
+
+### v3.6.0
+
+- **`--sync-models` detects outdated builds.** Each installed pick is compared with the build the registry now serves for its tag. It compares the `ollama list` ID with the SHA-256 of the registry's manifest, which needs one small request and no download. Outdated picks are marked and offered for update (default no).
+  - **Updates follow the same safety rules as pulls:** they count toward the disk check, must succeed before any removal, and a failed update blocks all removals.
+  - **An unreachable registry doesn't stop the sync.** Installed picks show as `unchecked` and the rest carries on.
+- **Found on a real install:** a seven-week-old `qwen3.6:35b-a3b` had different weights from the current tag. Updating it made it share weights with `qwen3.6:35b-a3b-coding` and shrank Ollama's blob store from 62 GB to 40 GB.
+- **CI:** the stub `ollama list` now reports IDs derived from the stub registry's manifests, so the sync tests never touch the real registry. New cases cover an update, a failed update, and an unreachable registry. The update check was mutation-tested.
 
 ### v3.5.1
 
