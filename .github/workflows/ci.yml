@@ -328,7 +328,7 @@ jobs:
             : > "$RUNNER_TEMP/ollama.log"
             # Not called inside $(...): SYNC_RC, SYNC_HOME and out must reach the step.
             SYNC_RC=0
-            printf '%s\n' $4 | HOME="$h" PATH="$RUNNER_TEMP/fakebin:$PATH" \
+            printf '%s\n' $4 | HOME="$h" PATH="$RUNNER_TEMP/fakebin:$RUNNER_TEMP/fakecurl:$PATH" \
               FAKE_CHIP="$1" FAKE_NCPU="$2" FAKE_RAM_GB="$3" FAKE_GPU="" \
               FAKE_DISK_GB="${FAKE_DISK_GB:-500}" \
               FAKE_OLLAMA_LOG="$RUNNER_TEMP/ollama.log" \
@@ -348,8 +348,16 @@ jobs:
           case "$1" in
             list)
               [ -z "${FAKE_OLLAMA_DOWN:-}" ] || { echo "Error: could not connect to ollama" >&2; exit 1; }
+              # ID = first 12 hex of sha256 of the manifest, as real Ollama does. The
+              # stub registry serves "manifest:<tag>:v1"; a model in FAKE_STALE was
+              # pulled from an older manifest, so its ID differs.
               echo "NAME                      ID              SIZE      MODIFIED"
-              for m in ${FAKE_OLLAMA_MODELS:-}; do echo "$m    0123456789ab    4.1 GB    2 weeks ago"; done ;;
+              for m in ${FAKE_OLLAMA_MODELS:-}; do
+                n="$m"; case "$n" in *:*) ;; *) n="$n:latest" ;; esac
+                rev=v1; case " ${FAKE_STALE:-} " in *" $n "*) rev=old ;; esac
+                id="$(printf 'manifest:%s:%s' "$n" "$rev" | sha256sum | cut -c1-12)"
+                echo "$m    $id    4.1 GB    2 weeks ago"
+              done ;;
             pull)
               case " ${FAKE_PULL_FAIL:-} " in *" $2 "*) echo "Error: pull failed" >&2; exit 1 ;; esac ;;
             rm) echo "deleted '$2'" ;;
@@ -377,7 +385,14 @@ jobs:
           mkdir -p "$RUNNER_TEMP/fakecurl"
           cat > "$RUNNER_TEMP/fakecurl/curl" <<'EOF'
           #!/bin/bash
-          url=""; for a in "$@"; do case "$a" in http*) url="$a" ;; esac; done
+          url=""; out=""; prev=""
+          for a in "$@"; do case "$a" in http*) url="$a" ;; esac; [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
+          [ -z "${FAKE_REG_DOWN:-}" ] || exit 7
+          # Manifest fetch into a file (not the -o /dev/null status probes).
+          if [ -n "$out" ] && [ "$out" != "/dev/null" ]; then
+            t="${url#*/v2/library/}"; tag="${t%%/manifests/*}:${t##*/manifests/}"
+            printf 'manifest:%s:v1' "$tag" > "$out"; exit 0
+          fi
           case "$url" in
             *registry.ollama.ai/v2/library/*/manifests/*)
               t="${url#*/v2/library/}"; tag="${t%%/manifests/*}:${t##*/manifests/}"
@@ -550,6 +565,42 @@ jobs:
           printf '%s\n' '32|qwen3.6:35b-a3b|24|moe|daily|yes|x' > "$nodate"
           label="--recommend with no Last-Updated line"; out="$(simulate 'Apple M4 Pro' 12 64 '' "$nodate")"
           expect 'daily: +qwen3.6:35b-a3b$'; expect 'no readable .Last-Updated'
+
+      - name: 'Sync: outdated installed pick is offered for update, current one is not'
+        run: |
+          . "$RUNNER_TEMP/simulate.sh"
+          label="sync update"
+          export FAKE_OLLAMA_MODELS="qwen3.6:35b-a3b qwen3.8:27b" FAKE_STALE="qwen3.6:35b-a3b"
+          # prompts in pick order: update qwen3.6 y | coding n | granite n
+          sync 'Apple M4 Pro' 12 64 'y n n'
+          [ "$SYNC_RC" -eq 0 ] || { echo "FAIL: exit $SYNC_RC"; exit 1; }
+          expect 'qwen3\.6:35b-a3b .* outdated'; expect 'qwen3\.8:27b .* current'
+          expect 'Update qwen3\.6:35b-a3b'; reject 'Update qwen3\.8:27b'
+          called 'pull qwen3.6:35b-a3b'; not_called 'pull qwen3.8:27b'
+          printf '%s\n' "$out" | awk '/^  Updated:/ { getline; print }' | grep -q 'qwen3\.6:35b-a3b' \
+            || { echo "FAIL: update not listed under Updated"; exit 1; }
+          echo "ok   [$label] listed under Updated"
+
+      - name: 'Sync: a failed update blocks every removal'
+        run: |
+          . "$RUNNER_TEMP/simulate.sh"
+          label="sync update fails"
+          export FAKE_OLLAMA_MODELS="qwen3.6:35b-a3b llama3.3:70b" FAKE_STALE="qwen3.6:35b-a3b" FAKE_PULL_FAIL="qwen3.6:35b-a3b"
+          # update y | qwen3.8 n | coding n | granite n | (removal llama3.3 would be y)
+          sync 'Apple M4 Pro' 12 64 'y n n n y'
+          [ "$SYNC_RC" -eq 1 ] || { echo "FAIL: expected exit 1, got $SYNC_RC"; exit 1; }
+          called 'pull qwen3.6:35b-a3b'; not_called 'rm llama3.3:70b'
+
+      - name: 'Sync: unreachable registry marks picks unchecked and carries on'
+        run: |
+          . "$RUNNER_TEMP/simulate.sh"
+          label="sync registry down"
+          export FAKE_OLLAMA_MODELS="qwen3.6:35b-a3b" FAKE_STALE="qwen3.6:35b-a3b" FAKE_REG_DOWN=1
+          # qwen3.8 n | coding n | granite n; no update prompt possible
+          sync 'Apple M4 Pro' 12 64 'n n n'
+          [ "$SYNC_RC" -eq 0 ] || { echo "FAIL: exit $SYNC_RC"; exit 1; }
+          expect 'qwen3\.6:35b-a3b .* unchecked'; expect 'Registry unreachable'
+          reject 'Update qwen3\.6'; not_called 'pull qwen3.6:35b-a3b'
 
       - name: 'Sync: disk shortfall stops before any pull'
         run: |
