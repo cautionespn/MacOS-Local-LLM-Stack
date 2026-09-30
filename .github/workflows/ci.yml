@@ -237,7 +237,7 @@ jobs:
             | awk -F'|' '{
                 gsub(/^[ \t]+|[ \t]+$/, "", $6)
                 if ($6 != "yes" && $6 != "no") {
-                  printf "FAIL: VERIFIED column is '%s' (expected yes or no)\n", $6
+                  printf "FAIL: VERIFIED column is \"%s\" (expected yes or no)\n", $6
                   exit 1
                 }
               }'
@@ -250,7 +250,7 @@ jobs:
             | awk -F'|' '{
                 gsub(/^[ \t]+|[ \t]+$/, "", $4)
                 if ($4 != "moe" && $4 != "dense") {
-                  printf "FAIL: ARCH column is '%s' (expected moe or dense)\n", $4
+                  printf "FAIL: ARCH column is \"%s\" (expected moe or dense)\n", $4
                   exit 1
                 }
               }'
@@ -263,7 +263,7 @@ jobs:
             | awk -F'|' '{
                 gsub(/^[ \t]+|[ \t]+$/, "", $5)
                 if ($5 !~ /^(daily|coding|vision|light|reasoning)$/) {
-                  printf "FAIL: ROLE column is '%s'\n", $5
+                  printf "FAIL: ROLE column is \"%s\"\n", $5
                   exit 1
                 }
               }'
