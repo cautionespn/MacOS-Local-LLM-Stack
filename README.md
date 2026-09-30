@@ -67,7 +67,8 @@ The script checks the first two itself and refuses to run on the wrong architect
 ## Quick start
 
 ```bash
-curl -O https://example.com/llmstack-macos.sh   # or clone the repo
+# Download the latest release
+curl -fLO https://github.com/cautionespn/MacOS-Local-LLM-Stack/releases/latest/download/llmstack-macos.sh
 chmod +x llmstack-macos.sh
 
 # Inspect the machine first. Installs nothing, downloads nothing.
@@ -795,6 +796,13 @@ A few choices worth explaining, since they're the ones people tend to want to ch
 
 ## Changelog
 
+### v3.6.1
+
+- **License made consistent.** The repository's `LICENSE` file is GPL v3, but the script header and README said public domain / CC0. Both now state GPL v3 and point to `LICENSE`.
+- **Quick start downloads the latest release.** It previously pointed at a placeholder URL. It now uses `releases/latest/download/llmstack-macos.sh`, so it always gets the newest published release rather than unreleased work on `main`.
+- **Release workflow.** `.github/workflows/release-asset.yml` attaches `llmstack-macos.sh` to each published release, and refuses if the release tag doesn't match the script's `SCRIPT_VERSION`.
+- **CI:** three catalogue-format checks lost the quotes around the offending value in their failure messages, a shell-quoting slip inside the awk programs. Found by actionlint; the checks themselves were unaffected.
+
 ### v3.6.0
 
 - **`--sync-models` detects outdated builds.** Each installed pick is compared with the build the registry now serves for its tag. It compares the `ollama list` ID with the SHA-256 of the registry's manifest, which needs one small request and no download. Outdated picks are marked and offered for update (default no).
@@ -879,7 +887,7 @@ A few choices worth explaining, since they're the ones people tend to want to ch
 
 ## License
 
-Public domain / CC0. Use it, fork it, sell it, no attribution required.
+Licensed under the [GNU General Public License v3.0](LICENSE). You may use, study, modify and share it. If you distribute it or a modified version, you must do so under the same license, with the source available. The [LICENSE](LICENSE) file has the full terms.
 
 ---
 

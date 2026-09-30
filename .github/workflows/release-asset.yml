@@ -1,0 +1,44 @@
+name: Release asset
+
+# Attaches llmstack-macos.sh to each published release, so the README's
+# Quick start URL (.../releases/latest/download/llmstack-macos.sh) always
+# serves the newest release. Also runnable by hand for an existing tag.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to attach the script to (e.g. 3.6.1)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  attach:
+    name: Attach llmstack-macos.sh
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # Via env, never interpolated into the script body: a tag name is
+      # user-controlled input.
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - name: Refuse if the tag and the script version disagree
+        run: |
+          version=$(grep -m1 '^SCRIPT_VERSION=' llmstack-macos.sh | cut -d'"' -f2)
+          echo "Release tag: $TAG   Script version: $version"
+          [ "$version" = "${TAG#v}" ] \
+            || { echo "::error::Release $TAG contains llmstack-macos.sh v$version; not attaching it."; exit 1; }
+
+      - name: Syntax check
+        run: bash -n llmstack-macos.sh
+
+      - name: Attach to the release
+        run: gh release upload "$TAG" llmstack-macos.sh --clobber --repo "$GITHUB_REPOSITORY"

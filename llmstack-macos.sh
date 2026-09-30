@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# llmstack-macos.sh  v3.6.0
+# llmstack-macos.sh  v3.6.1
 #
 # A self-contained, private LLM stack for macOS on Apple Silicon.
 #
@@ -15,14 +15,15 @@
 #
 # Run  ./llmstack-macos.sh --help  for full documentation.
 #
-# License: public domain / CC0. Share and modify freely.
+# License: GNU General Public License v3.0. See the LICENSE file in
+# https://github.com/cautionespn/MacOS-Local-LLM-Stack for the full text.
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="3.6.0"
+SCRIPT_VERSION="3.6.1"
 CATALOG_DATE="2026-09-30"
 # The script version in which the built-in catalogue rows last changed.
 # Written into every built-in catalogue; --sync-models offers to replace a
