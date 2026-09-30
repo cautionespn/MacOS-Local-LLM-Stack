@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# llmstack-macos.sh  v3.3.0
+# llmstack-macos.sh  v3.4.0
 #
 # A self-contained, private LLM stack for macOS on Apple Silicon.
 #
@@ -22,10 +22,17 @@ set -euo pipefail
 # Constants
 # ---------------------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="3.3.0"
-CATALOG_DATE="2026-08-09"
+SCRIPT_VERSION="3.4.0"
+CATALOG_DATE="2026-09-30"
 CATALOG_WARN_DAYS=90
 CATALOG_STALE_DAYS=180
+
+# Dense-model speed gate. Token generation reads every weight of a dense
+# model per token, so tok/s ~= bandwidth / model size. Real runs reach
+# roughly 65 percent of the theoretical figure. A dense entry is only
+# recommended when it would still generate at DENSE_MIN_TPS or better.
+DENSE_MIN_TPS=8
+DENSE_EFFICIENCY_PCT=65
 
 # ---------------------------------------------------------------------------
 # Paths and defaults
@@ -209,8 +216,9 @@ check_stray_llm_defs() {
 # ===========================================================================
 # MODEL CATALOGUE
 # ===========================================================================
-# Model tags verified against https://ollama.com/library on 2026-08-09.
-# Sizes are approximate for the default Q4_0 quantization used by Ollama.
+# Model tags verified against https://ollama.com/library on 2026-09-30.
+# SIZE_GB is the download size of that exact tag, which is not always a
+# q4 quantization; it may be a decimal.
 write_default_catalog() {
   mkdir -p "$CONFIG_DIR"
   cat > "$CATALOG" <<CATALOG_EOF
@@ -225,20 +233,24 @@ write_default_catalog() {
 # the Last-Updated line above; the script reads it and will tell you how
 # stale the file has become.
 #
-# Sizing rule used by the script
+# Selection rule used by the script
 # -----------------------------------------------------------------------
-# Roughly 70 percent of unified memory is usable for model weights. The
-# remainder goes to macOS, the inference engine, the KV cache and anything
-# else running. The script computes that budget and picks the largest entry
-# that fits.
+# Within each role, the largest entry that passes all three gates wins:
+#   1. SIZE_GB fits the budget, about 70 percent of unified memory. The
+#      rest goes to macOS, the inference engine and the KV cache.
+#   2. The machine has at least MIN_RAM_GB of memory.
+#   3. Dense entries only: the chip's memory bandwidth can generate at
+#      ${DENSE_MIN_TPS} tok/s or better. MoE entries are exempt.
+# Because the largest passing entry wins, keep size tracking quality within
+# a role, and do not list several quantizations of the same model.
 #
 # Why architecture matters on Apple Silicon
 # -----------------------------------------------------------------------
 # Token generation is limited by memory bandwidth, not compute. A dense
-# model touches every parameter for every token. A mixture-of-experts model
-# activates only a fraction, so it generates far faster while still needing
-# the full weight set resident in memory. On bandwidth-constrained chips,
-# base-tier parts especially, prefer MoE.
+# model reads every parameter for every token. A mixture-of-experts model
+# reads only its active experts, so it generates far faster while still
+# needing the full weight set resident in memory. Gate 3 is what keeps
+# large dense models off chips too slow to drive them.
 #
 # The VERIFIED column
 # -----------------------------------------------------------------------
@@ -249,36 +261,28 @@ write_default_catalog() {
 #
 # Format: MIN_RAM_GB|TAG|SIZE_GB|ARCH|ROLE|VERIFIED|NOTES
 # ===========================================================================
+# --- Light (fallback for the smallest machines) ----------------------------
+8|granite4.2:3b|2.2|dense|light|yes|IBM Granite 4.2 3B. Tiny and fast, with a thinking mode.
 # --- Daily drivers ---------------------------------------------------------
-# llama3.3:70b is Meta's improved 70B — same size as 3.1, better quality.
-# gemma3 models are multimodal (text + image input).
-# phi4 is Microsoft's 14B — excellent reasoning, strong on 16 GB machines.
-48|llama3.3:70b|43|dense|daily|yes|Meta's improved 70B. Same size as 3.1, better quality. Slow on anything below Max tier.
-32|qwen2.5:32b-instruct|19|dense|daily|yes|Strong general-purpose model. Fits with limited headroom for long context.
-16|gemma3:12b|8|dense|daily|yes|Google Gemma 3. Multimodal (text+image). Excellent quality for the size.
-16|qwen2.5:14b-instruct|9|dense|daily|yes|Solid mid-size model for 16 GB machines.
-16|phi4:14b|9|dense|daily|yes|Microsoft Phi-4. Excellent reasoning and code for 14B.
-8|qwen2.5:7b-instruct|5|dense|daily|yes|Fast and capable for constrained machines.
-4|gemma3:4b|3|dense|daily|yes|Google Gemma 3. Multimodal. Small but capable.
-4|llama3.2:3b|2|dense|light|yes|Very small, very fast. Good fallback for constrained machines.
-# --- Reasoning (DeepSeek R1) -----------------------------------------------
-# DeepSeek R1 distills produce chain-of-thought reasoning tokens before
-# the final answer. Excellent for math, logic, and complex analysis.
-# Slower than instruct models for simple chat — use daily drivers for that.
-48|deepseek-r1:70b|43|dense|reasoning|yes|Distilled from Llama 3.1 70B. Best open reasoning model. Produces chain-of-thought.
-32|deepseek-r1:32b|19|dense|reasoning|yes|Distilled from Qwen 2.5 32B. Strong reasoning, fits 32 GB.
-16|deepseek-r1:14b|9|dense|reasoning|yes|Distilled from Qwen 2.5 14B. Good reasoning for 16 GB machines.
-8|deepseek-r1:8b|5|dense|reasoning|yes|Distilled from Llama 3.1 8B. Reasoning on constrained machines.
+8|qwen3.5:4b|3.4|dense|daily|yes|Qwen 3.5 4B. Strongest general model under 5 GB. Text and image input.
+16|gemma4:12b|7.6|dense|daily|yes|Google Gemma 4 12B. Strong all-rounder for 16 GB machines. Multimodal.
+24|gemma4:26b-a4b-it-qat|16|moe|daily|yes|Gemma 4 26B MoE, about 4B active, QAT build. The strong MoE that fits a 24 GB budget.
+32|qwen3.6:35b-a3b|23|moe|daily|yes|Qwen 3.6 35B MoE, 3B active. Fast on every chip tier. Multimodal. Needs 36 GB or more.
+# --- Reasoning -------------------------------------------------------------
+8|qwen3.5:4b|3.4|dense|reasoning|yes|Qwen 3.5 4B with its thinking mode.
+16|gemma4:12b|7.6|dense|reasoning|yes|Gemma 4 12B. Strong maths and reasoning for its size.
+24|gemma4:26b-a4b-it-qat|16|moe|reasoning|yes|Gemma 4 26B MoE. Reasoning on chips too slow for a dense 27B.
+32|qwen3.8:27b|18|dense|reasoning|yes|Qwen 3.8 27B. Top small open model on independent indexes. Dense, so it needs M4 Pro-class bandwidth or better. Uses many tokens.
 # --- Coding ----------------------------------------------------------------
-48|qwen2.5-coder:32b-instruct|19|dense|coding|yes|Code-specialised. Excellent for programming tasks.
-32|qwen2.5-coder:14b-instruct|9|dense|coding|yes|Lighter coding option.
-8|qwen2.5-coder:7b-instruct|5|dense|coding|yes|Small coding model.
+8|qwen3.5:4b|3.4|dense|coding|yes|Qwen 3.5 4B. Best coding option under 5 GB.
+16|qwen3.5:9b|6.6|dense|coding|yes|Qwen 3.5 9B. Stronger agentic coding than Gemma 4 12B.
+24|devstral-small-2:24b|15|dense|coding|yes|Mistral Devstral Small 2 24B. Strong agentic coding. Dense, so it needs Pro-class bandwidth.
+32|qwen3.6:35b-a3b-coding|23|moe|coding|yes|Qwen 3.6 35B MoE with its coding sampling preset. Same weights as the daily tag.
 # --- Vision ----------------------------------------------------------------
-32|llama3.2-vision:11b|7|dense|vision|yes|Multimodal vision-language model.
-16|llama3.2-vision:11b|7|dense|vision|yes|Vision model for 16 GB machines.
-16|gemma3:12b|8|dense|vision|yes|Gemma 3 is multimodal. Good vision option for 16 GB machines.
-# --- MoE (preferred for bandwidth-limited chips) ---------------------------
-48|mixtral:8x7b|26|moe|daily|yes|8-expert MoE. Fast inference, large weights. Good for bandwidth-limited chips.
+8|qwen3.5:4b|3.4|dense|vision|yes|Qwen 3.5 4B. Image input on the smallest machines.
+16|gemma4:12b|7.6|dense|vision|yes|Gemma 4 12B. Image input.
+24|gemma4:26b-a4b-it-qat|16|moe|vision|yes|Gemma 4 26B MoE. Image input.
+32|qwen3.6:35b-a3b|23|moe|vision|yes|Qwen 3.6 35B MoE. Leads Gemma 4 26B on vision evals.
 CATALOG_EOF
 }
 
@@ -618,10 +622,12 @@ apply_catalog_proposal() {
 # ===========================================================================
 # SYSTEM DETECTION
 # ===========================================================================
-# Works on macOS (real hardware) and on Linux (CI). On Linux, sysctl keys
-# and df -g don't exist, so values fall back to 0/unknown gracefully.
+# Works on macOS (real hardware) and on Linux (CI). On Linux the sysctl
+# keys don't exist, so the chip reads as unknown and sizing falls back to
+# memory alone.
 detect_system() {
   SYS_CHIP="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo 'unknown')"
+  SYS_CHIP="$(_trim "$SYS_CHIP")"
   SYS_CORES="$(sysctl -n hw.ncpu 2>/dev/null || echo '?')"
   local mem_bytes
   mem_bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
@@ -630,10 +636,13 @@ detect_system() {
   # is non-zero and at least the light-tier entries match.
   [ "$SYS_RAM_GB" -gt 0 ] || SYS_RAM_GB=8
   SYS_USABLE_GB=$(( SYS_RAM_GB * 70 / 100 ))
-  # macOS: df -g shows in GB. Linux: fall back to df -h (MB) or empty.
-  SYS_DISK_FREE_GB="$(df -g "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')" || \
-    SYS_DISK_FREE_GB="$(df -h "$HOME" 2>/dev/null | awk 'NR==2 {print $4}' | tr -d 'G')" || \
-    SYS_DISK_FREE_GB=""
+  # macOS df takes -g (GB). GNU df rejects -g; use -BG there so the value
+  # is always whole GB (df -h would give T or M units on some disks).
+  if df -g "$HOME" >/dev/null 2>&1; then
+    SYS_DISK_FREE_GB="$(df -g "$HOME" | awk 'NR==2 {print $4}')"
+  else
+    SYS_DISK_FREE_GB="$(df -BG "$HOME" 2>/dev/null | awk 'NR==2 {gsub(/G/, "", $4); print $4}')"
+  fi
   [ -n "$SYS_DISK_FREE_GB" ] || SYS_DISK_FREE_GB=0
   case "$SYS_CHIP" in
     *Ultra*) SYS_TIER="Ultra" ;;
@@ -642,27 +651,113 @@ detect_system() {
     *Apple*) SYS_TIER="Base" ;;
     *)       SYS_TIER="Unknown" ;;
   esac
+  SYS_BANDWIDTH="$(chip_bandwidth)"
+  if [ -n "$SYS_BANDWIDTH" ]; then
+    SYS_DENSE_CAP_GB="$(awk -v bw="$SYS_BANDWIDTH" -v eff="$DENSE_EFFICIENCY_PCT" \
+      -v tps="$DENSE_MIN_TPS" 'BEGIN { printf "%.1f", bw * eff / 100 / tps }')"
+  else
+    SYS_DENSE_CAP_GB=""
+  fi
+}
+
+# GPU core count, used only to split the two M5 Max bins. Empty if ioreg
+# is unavailable or reports nothing.
+gpu_core_count() {
+  ioreg -rc AGXAccelerator 2>/dev/null \
+    | awk -F'= ' '/"gpu-core-count"/ { gsub(/[^0-9]/, "", $2); print $2; exit }'
+}
+
+# Unified-memory bandwidth in GB/s for the detected chip, from Apple's
+# published tech specs (M1 base from Wikipedia; Apple never published it).
+# Echoes nothing for a non-Apple host, which disables the dense-speed gate.
+# Chips sold in two bandwidth bins under one name are split as follows:
+#   M3 Max, M4 Max  total CPU cores: 16 is the faster bin, 14 the slower
+#   M5 Max          both bins have 18 CPU cores; split on GPU cores (40 vs
+#                   32), else on memory (the 32-GPU bin ships only at 36 GB)
+#   M6              identical cores; the 16 GB model is the slower bin
+# An Apple chip not in the table (a newer generation) takes the newest known
+# generation's slower bin for its tier: never slower than today's chips.
+chip_bandwidth() {
+  local gpu chip
+  # Virtualised Macs (e.g. CI runners) append a suffix such as
+  # " (Virtual)" to the brand string; look up the underlying chip.
+  chip="${SYS_CHIP%% (*}"
+  case "$chip" in
+    "Apple M1")        echo 68 ;;
+    "Apple M1 Pro")    echo 200 ;;
+    "Apple M1 Max")    echo 400 ;;
+    "Apple M1 Ultra")  echo 800 ;;
+    "Apple M2")        echo 100 ;;
+    "Apple M2 Pro")    echo 200 ;;
+    "Apple M2 Max")    echo 400 ;;
+    "Apple M2 Ultra")  echo 800 ;;
+    "Apple M3")        echo 100 ;;
+    "Apple M3 Pro")    echo 150 ;;
+    "Apple M3 Max")    if [ "$SYS_CORES" = "16" ]; then echo 400; else echo 300; fi ;;
+    "Apple M3 Ultra")  echo 819 ;;
+    "Apple M4")        echo 120 ;;
+    "Apple M4 Pro")    echo 273 ;;
+    "Apple M4 Max")    if [ "$SYS_CORES" = "16" ]; then echo 546; else echo 410; fi ;;
+    "Apple M5")        echo 153 ;;
+    "Apple M5 Pro")    echo 307 ;;
+    "Apple M5 Max")
+      gpu="$(gpu_core_count)"
+      if [ "$gpu" = "40" ]; then echo 614
+      elif [ "$gpu" = "32" ]; then echo 460
+      elif [ "$SYS_RAM_GB" -ge 48 ]; then echo 614
+      else echo 460
+      fi ;;
+    "Apple M5 Ultra")  echo 1200 ;;
+    "Apple M6")        if [ "$SYS_RAM_GB" -le 16 ]; then echo 153; else echo 170; fi ;;
+    *)
+      case "$SYS_TIER" in
+        Ultra) echo 1200 ;;
+        Max)   echo 460 ;;
+        Pro)   echo 307 ;;
+        Base)  echo 153 ;;
+        *)     : ;;
+      esac ;;
+  esac
 }
 
 bandwidth_note() {
   case "$SYS_TIER" in
-    Ultra) echo "Ultra tier. Very high memory bandwidth; dense models are comfortable." ;;
-    Max)   echo "Max tier. High memory bandwidth; dense models run well." ;;
-    Pro)   echo "Pro tier. Good memory bandwidth; MoE models are fast, dense mid-size models are usable." ;;
-    Base)  echo "Base tier. Lower memory bandwidth; strongly prefer MoE models." ;;
-    *)     echo "Unrecognised chip. Sizing by memory alone." ;;
+    Ultra) echo "Ultra tier. Very high memory bandwidth; large dense models are comfortable." ;;
+    Max)   echo "Max tier. High memory bandwidth; dense models up to the cap below run well." ;;
+    Pro)   echo "Pro tier. MoE models are fast; dense models are limited to the cap below." ;;
+    Base)  echo "Base tier. Lower memory bandwidth; only small dense models, MoE where it fits." ;;
+    *)     echo "Unrecognised chip tier. Sizing by memory alone; no dense-speed cap." ;;
   esac
+}
+
+# Prints the detected bandwidth and the resulting dense cap, or says why
+# there is none. Shared by --recommend and the install banner.
+print_bandwidth_lines() {
+  if [ -n "$SYS_BANDWIDTH" ]; then
+    printf '  Memory bandwidth:  %s GB/s\n' "$SYS_BANDWIDTH"
+    printf '  Dense model cap:   ~%s GB  (keeps dense models at %s tok/s or better)\n' \
+      "$SYS_DENSE_CAP_GB" "$DENSE_MIN_TPS"
+  else
+    printf '  Memory bandwidth:  unknown  (no dense-speed cap applied)\n'
+  fi
 }
 
 best_for_role() {
   local role="$1"
   [ -f "$CATALOG" ] || return 0
-  awk -F'|' -v budget="$SYS_USABLE_GB" -v ram="$SYS_RAM_GB" -v want="$role" '
+  # Three gates, then the largest survivor wins. Gate 3 (dense speed) is
+  # skipped when the chip is unrecognised, so an empty cap means "no cap".
+  # OFS="|" so that trimming a field rebuilds $0 with pipes, not spaces;
+  # otherwise field() cannot re-split a hand-edited line with padding.
+  awk -F'|' -v OFS='|' -v budget="$SYS_USABLE_GB" -v ram="$SYS_RAM_GB" -v want="$role" \
+      -v cap="${SYS_DENSE_CAP_GB:-}" '
     /^[[:space:]]*#/ { next }
     /^[[:space:]]*$/ { next }
     {
       gsub(/^[ \t]+|[ \t]+$/, "", $2)
+      gsub(/^[ \t]+|[ \t]+$/, "", $4)
       gsub(/^[ \t]+|[ \t]+$/, "", $5)
+      if ($4 == "dense" && cap != "" && ($3 + 0) > (cap + 0)) next
       if ($5 == want && ($1 + 0) <= ram && ($3 + 0) <= budget && ($3 + 0) > best) {
         best = $3 + 0
         line = $0
@@ -738,6 +833,7 @@ SYSINFO
   printf '  Unified memory:    %s GB\n' "$SYS_RAM_GB"
   printf '  Usable for models: ~%s GB  (about 70 percent)\n' "$SYS_USABLE_GB"
   printf '  Free disk:         %s GB\n' "$SYS_DISK_FREE_GB"
+  print_bandwidth_lines
   printf '  %s\n' "$(bandwidth_note)"
   cat <<'SYSINFO2'
 ===========================================================================
@@ -904,13 +1000,23 @@ STARTUP BEHAVIOUR AND ITS LIMITS
     Docker is a genuine systemd service, and point this machine at it with
     --searxng-url. That mode installs no container runtime at all.
 MODEL SELECTION
-    Roughly 70 percent of unified memory is usable for model weights; the
-    rest goes to macOS, the inference engine and the KV cache. The script
-    computes that budget and picks the largest catalogue entry that fits.
-    Memory bandwidth matters as much as capacity. Token generation is
-    bandwidth-bound, so a mixture-of-experts model, which activates only a
-    fraction of its parameters per token, generates far faster than a dense
-    model of the same size. On base-tier chips this is decisive.
+    Within each role, the largest catalogue entry that passes three gates
+    is recommended:
+      1. Its size fits the budget: roughly 70 percent of unified memory.
+         The rest goes to macOS, the inference engine and the KV cache.
+      2. The machine has at least the entry's MIN_RAM_GB.
+      3. Dense entries only: the chip's memory bandwidth can generate at
+         ${DENSE_MIN_TPS} tok/s or better. The cap is bandwidth x
+         ${DENSE_EFFICIENCY_PCT} percent / ${DENSE_MIN_TPS} tok/s.
+    Token generation is bandwidth-bound: a dense model reads every weight
+    per token, a mixture-of-experts model only its active experts. Gate 3
+    therefore keeps large dense models off chips too slow to drive them,
+    while MoE models are exempt. Bandwidth comes from a built-in table of
+    Apple's published figures for M1 through M6, including the two bins of
+    M3 Max, M4 Max, M5 Max and M6. A newer, unlisted chip is assumed to
+    match the newest known generation for its tier. On a non-Apple host the
+    gate is off and sizing uses memory alone. --recommend shows the
+    detected bandwidth and the resulting dense cap.
     Catalogue entries carry a VERIFIED flag. Tags marked no are plausible
     but unconfirmed and may fail to pull; the script warns first and, if a
     pull fails, points at https://ollama.com/library rather than aborting.
@@ -1395,6 +1501,7 @@ printf '  Tier:              %s\n' "$SYS_TIER"
 printf '  Unified memory:    %s GB\n' "$SYS_RAM_GB"
 printf '  Usable for models: ~%s GB\n' "$SYS_USABLE_GB"
 printf '  Free disk:         %s GB\n' "$SYS_DISK_FREE_GB"
+print_bandwidth_lines
 printf '  %s\n' "$(bandwidth_note)"
 cat <<'DETECTED_FTR'
 ===========================================================================
@@ -1449,8 +1556,11 @@ else
       printf '  longer exist. If the pull fails, check\n'
       printf '  https://ollama.com/library and correct %s\n' "$CATALOG"
     fi
-    if [ "$SYS_DISK_FREE_GB" -lt $(( MODEL_SIZE + 10 )) ]; then
-      warn "Only ${SYS_DISK_FREE_GB} GB free; about $(( MODEL_SIZE + 10 )) GB is wanted."
+    # MODEL_SIZE can be a decimal (e.g. 7.6), which bash arithmetic rejects
+    # and which would abort the install under set -e. Compare in awk.
+    DISK_WANTED_GB="$(awk -v s="$MODEL_SIZE" 'BEGIN { printf "%d", s + 10.999 }')"
+    if awk -v f="$SYS_DISK_FREE_GB" -v w="$DISK_WANTED_GB" 'BEGIN { exit !(f + 0 < w + 0) }'; then
+      warn "Only ${SYS_DISK_FREE_GB} GB free; about ${DISK_WANTED_GB} GB is wanted."
       echo "    Free some space, or re-run with --no-model."
     fi
   fi

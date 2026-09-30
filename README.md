@@ -132,30 +132,54 @@ Examples:
 ./llmstack-macos.sh --no-model --no-drawthings
 
 # Override the recommendation
-./llmstack-macos.sh --model qwen2.5:32b-instruct
+./llmstack-macos.sh --model qwen3.8:27b
 ```
 
 ---
 
 ## How models are chosen
 
-The script reads your chip, memory, and free disk, then picks the largest catalogue entry that genuinely suits the machine.
+The script reads your chip, memory, memory bandwidth, and free disk. Within each role it then picks the **largest catalogue entry that passes three gates**:
 
-**Two gates, not one.** An entry must fit the memory budget *and* be sensible for the machine class:
+1. **Memory budget** — roughly 70% of unified memory is usable for model weights. The rest goes to macOS, the inference engine, and the KV cache. A 64 GB Mac has about a 44 GB budget.
+2. **Machine class** — the machine has at least the entry's `MIN_RAM_GB`.
+3. **Dense speed** — *dense* entries only: the chip's memory bandwidth must be able to generate at 8 tok/s or better. MoE entries are exempt.
 
-- **Memory budget** — roughly 70% of unified memory is usable for model weights. The rest goes to macOS, the inference engine, and the KV cache. A 64 GB Mac has about a 44 GB budget.
-- **Machine class** — each entry declares a minimum RAM tier. This exists because *fitting* and *running well* are different things. A 43 GB dense 70B model fits a 44 GB budget on paper, but on a Pro-tier chip it generates at reading speed at best. The gate keeps it off machines that can hold it but can't drive it.
+**Why the third gate exists.** Token generation on Apple Silicon is memory-bandwidth-bound, not compute-bound. A dense model reads every weight for every token, so its speed is roughly bandwidth ÷ model size. *Fitting* and *running well* are different things: a 43 GB dense 70B fits a 64 GB M4 Pro's 44 GB budget, but at 273 GB/s it would generate at reading speed at best. A mixture-of-experts (MoE) model reads only its active experts — `qwen3.6:35b-a3b` has 35B parameters but about 3B active per token — so it stays fast on any chip while still needing all of its weights resident.
 
-**Why bandwidth matters more than you'd expect.** Token generation on Apple Silicon is memory-bandwidth-bound, not compute-bound. A dense model touches every parameter for every token. A mixture-of-experts (MoE) model activates only a fraction — `mixtral:8x7b` has 46.7B total parameters but roughly 12.9B active per token — so it generates far faster while still needing all 46.7B resident in memory. On base-tier chips this is decisive; the script's bandwidth note reflects your chip's tier.
+The dense cap is `bandwidth × 65% ÷ 8 tok/s` (both constants are at the top of the script). Bandwidth comes from a built-in table of Apple's published figures:
 
-Roughly what you can expect:
-
-| Memory | Budget | Typical pick |
+| Chip | Bandwidth | Dense cap |
 |---|---|---|
-| 8–16 GB | 5–11 GB | `qwen2.5:7b-instruct` or `llama3.2:3b` |
-| 24–32 GB | 16–22 GB | `qwen2.5:14b-instruct` or `qwen2.5:32b-instruct` |
-| 48–64 GB | 33–44 GB | `qwen2.5:32b-instruct` or `mixtral:8x7b` |
-| 96 GB+ | 67 GB+ | `llama3.1:70b` becomes viable |
+| M1 | 68 GB/s | ~5.5 GB |
+| M2, M3 | 100 GB/s | ~8 GB |
+| M4 | 120 GB/s | ~10 GB |
+| M5; M6 16 GB / 24–32 GB | 153 / 170 GB/s | ~12 / ~14 GB |
+| M3 Pro | 150 GB/s | ~12 GB |
+| M1 Pro, M2 Pro | 200 GB/s | ~16 GB |
+| M4 Pro | 273 GB/s | ~22 GB |
+| M5 Pro | 307 GB/s | ~25 GB |
+| M3 Max 14-core / 16-core | 300 / 400 GB/s | ~24 / ~32 GB |
+| M1 Max, M2 Max | 400 GB/s | ~32 GB |
+| M4 Max 14-core / 16-core | 410 / 546 GB/s | ~33 / ~44 GB |
+| M5 Max 32-GPU / 40-GPU | 460 / 614 GB/s | ~37 / ~50 GB |
+| M1/M2 Ultra, M3 Ultra | 800 / 819 GB/s | ~65 GB |
+| M5 Ultra | 1200 GB/s | ~97 GB |
+
+Chips sold in two bandwidth bins under one name are told apart by CPU core count (M3 Max, M4 Max), GPU core count from `ioreg` with memory size as fallback (M5 Max), or memory size (M6). A newer chip not in the table is assumed to match the newest known generation for its tier. On a non-Apple host the gate is off and sizing uses memory alone. `--recommend` prints the detected bandwidth and the resulting cap.
+
+**The largest passing entry wins — there is no blanket "prefer MoE" rule.** The speed gate already removes dense models exactly where bandwidth would make them slow. Beyond that, a dense model can be far better than any MoE that fits: `qwen3.8:27b` (dense) outscores `qwen3.6:35b-a3b` (MoE) by a wide margin on independent indexes, and on an M4 Pro or faster it runs fine.
+
+Roughly what you can expect from the shipped catalogue:
+
+| Machine | Daily | Reasoning | Coding |
+|---|---|---|---|
+| 8 GB | `qwen3.5:4b` | `qwen3.5:4b` | `qwen3.5:4b` |
+| 16 GB | `gemma4:12b` | `gemma4:12b` | `qwen3.5:9b` |
+| 24–32 GB | `gemma4:26b-a4b-it-qat` | `gemma4:26b-a4b-it-qat`, or `qwen3.8:27b` on a 32 GB M4 Pro+ | `devstral-small-2:24b` on Pro+; `qwen3.5:9b` on base chips |
+| 36 GB+ | `qwen3.6:35b-a3b` | `qwen3.8:27b` on M4 Pro/Max/Ultra or M5 Pro+; `gemma4:26b-a4b-it-qat` on slower chips | `qwen3.6:35b-a3b-coding` |
+
+Machines above 64 GB get the same picks as 36 GB. As of September 2026 no locally runnable model beat these picks in the 25–90 GB range. The larger options found — `qwen3.8-flash-next`, `laguna-s-2.1` — were an experimental preview or needed special builds, so they are left for you to add by hand.
 
 ---
 
@@ -174,13 +198,13 @@ MIN_RAM_GB | TAG | SIZE_GB | ARCH | ROLE | VERIFIED | NOTES
 ```
 
 ```
-48|qwen2.5:32b-instruct|19|dense|daily|yes|Strong general-purpose model.
+32|qwen3.6:35b-a3b|23|moe|daily|yes|Qwen 3.6 35B MoE, 3B active. Fast on every chip tier.
 ```
 
 ### The date header
 
 ```
-# Last-Updated: 2025-01-15
+# Last-Updated: 2026-09-30
 ```
 
 The script parses this and grades the file's age:
@@ -199,17 +223,33 @@ The script parses this and grades the file's age:
 
 The script warns before pulling an unverified tag, and if the pull fails it points you at [ollama.com/library](https://ollama.com/library) and continues rather than aborting — everything else stays installed.
 
-> **v3.1 note:** The shipped catalogue now uses real, verified model tags. All daily-driver and coding entries are marked `yes`. If you add entries yourself, mark them `no` until you've confirmed the tag exists at [ollama.com/library](https://ollama.com/library).
+If you add entries yourself, mark them `no` until you've confirmed the tag exists at [ollama.com/library](https://ollama.com/library), or run `--check-models` to have the script check and correct the column for you.
 
-### Catalogue contents (v3.1)
+`SIZE_GB` is the download size of that exact tag and may be a decimal (`7.6`). Because the largest passing entry wins, keep size tracking quality within a role, and don't list several quantizations of one model — the heaviest would always win.
 
-| Role | Tags included |
+### Catalogue contents (v3.4.0)
+
+| Role | Tags, smallest machine first |
 |---|---|
-| Daily | `qwen2.5:32b-instruct`, `qwen2.5:14b-instruct`, `llama3.1:70b` |
-| Light | `qwen2.5:7b-instruct`, `llama3.2:3b` |
-| Coding | `qwen2.5-coder:32b-instruct`, `qwen2.5-coder:14b-instruct`, `qwen2.5-coder:7b-instruct` |
-| Vision | `llama3.2-vision:11b` |
-| MoE | `mixtral:8x7b` |
+| Light | `granite4.2:3b` |
+| Daily | `qwen3.5:4b`, `gemma4:12b`, `gemma4:26b-a4b-it-qat` (MoE), `qwen3.6:35b-a3b` (MoE) |
+| Reasoning | `qwen3.5:4b`, `gemma4:12b`, `gemma4:26b-a4b-it-qat` (MoE), `qwen3.8:27b` |
+| Coding | `qwen3.5:4b`, `qwen3.5:9b`, `devstral-small-2:24b`, `qwen3.6:35b-a3b-coding` (MoE) |
+| Vision | `qwen3.5:4b`, `gemma4:12b`, `gemma4:26b-a4b-it-qat` (MoE), `qwen3.6:35b-a3b` (MoE) |
+
+Every tag was checked on [ollama.com/library](https://ollama.com/library) on 2026-09-30, and CI re-checks each against the registry on every push. `qwen3.6:35b-a3b-coding` is the same weights as `qwen3.6:35b-a3b` with a coding sampling preset, so pulling both costs no extra disk.
+
+### Upgrading from an earlier version
+
+Your existing catalogue is never overwritten, so after upgrading the script you keep the old model list. The new bandwidth gate applies to it immediately, but you won't see the new models until you regenerate the file:
+
+```bash
+mv ~/.config/llmstack/models.catalog ~/.config/llmstack/models.catalog.pre-3.4
+./llmstack-macos.sh --update       # brings Ollama current enough for newer model families
+./llmstack-macos.sh --recommend    # writes the v3.4.0 catalogue and shows the picks
+```
+
+Copy any hand-added rows across from the `.pre-3.4` file afterwards.
 
 ### Keeping the catalogue current
 
@@ -596,6 +636,15 @@ Then re-run with a different port:
 
 Expected — see [the limitation section](#startup-behaviour-and-one-real-limitation). Docker Desktop can't launch into the Aqua session from SSH. Use Colima (which the script installs) or move SearXNG to a Linux host.
 
+### The recommendation is smaller than my memory allows
+
+Probably the dense-speed gate working as intended. `--recommend` prints `Memory bandwidth` and `Dense model cap`. A dense entry larger than the cap is skipped because it would generate slower than 8 tok/s on your chip. You can:
+
+- Pull the larger model anyway: `ollama pull <tag>`, or install with `--model <tag>`, which skips the fit checks.
+- Lower `DENSE_MIN_TPS` at the top of the script if slower generation is acceptable to you.
+
+If the bandwidth shown is wrong for your chip, compare `sysctl -n machdep.cpu.brand_string` and `sysctl -n hw.ncpu` against the table in [How models are chosen](#how-models-are-chosen), and open an issue.
+
 ### Model pull fails
 
 The tag is probably wrong or retired. Check [ollama.com/library](https://ollama.com/library), then correct `~/.config/llmstack/models.catalog` and bump its `Last-Updated` line. Everything else stays installed; just pull manually:
@@ -674,7 +723,11 @@ A few choices worth explaining, since they're the ones people tend to want to ch
 
 **A catalogue file rather than hardcoded models.** Hardcoded recommendations rot silently. A dated file that the tooling reads and complains about makes the rot visible, and puts the fix in the hands of whoever is running it.
 
-**Two gates on model selection.** Checking only "does it fit in memory" recommends dense 70B models to 64 GB machines that will run them at a crawl. The `MIN_RAM_GB` column encodes machine class separately from size.
+**Three gates on model selection, and no blanket MoE preference.** Checking only "does it fit in memory" recommends dense 70B models to 64 GB machines that will run them at a crawl. A per-chip bandwidth table catches that directly, and works on catalogues users have already customised, because it lives in the script rather than the catalogue data. v3.3 and earlier specified "prefer MoE where both fit"; in practice that would have locked out the best small dense model on machines fast enough to run it, so v3.4.0 lets the speed gate express the MoE preference instead.
+
+**A per-chip bandwidth table rather than per-tier caps.** Bandwidth varies almost 2× within a tier (M3 Pro 150 GB/s vs M4 Pro 273 GB/s), so tier alone is too coarse. The cost is that the table needs a row for each new chip; until it gets one, a new chip is assumed to match the newest known generation for its tier.
+
+**A live registry check in CI rather than a blocklist.** Earlier versions kept a list of "known-fictional" tags. It aged badly: one listed tag, `llama3.3:70b`, was always real, and another, `qwen3.6:35b-a3b`, shipped later and is now in the catalogue. CI now fetches each shipped tag's manifest, and a 404 fails the build.
 
 **Single source of truth for status logic.** The status-checking code that runs in the script's `--status` mode and the `llmstatus` shell function share a single code block (`STATUS_BODY`). This eliminates the copy-paste divergence that affected earlier versions, where the two implementations drifted apart and reported different things.
 
@@ -683,6 +736,19 @@ A few choices worth explaining, since they're the ones people tend to want to ch
 ---
 
 ## Changelog
+
+### v3.4.0
+
+- **Per-chip memory-bandwidth gate.** A dense model is recommended only if the chip can generate at 8 tok/s or better. The cap is bandwidth × 65% ÷ 8 tok/s, using Apple's published figures for M1 through M6, including the binned M3 Max, M4 Max, M5 Max and M6. This fixes v3.3.0 recommending `llama3.3:70b` on 64 GB Pro-tier Macs, contrary to its own documentation. It applies to existing, customised catalogues too.
+- **"Prefer MoE" replaced by "largest entry passing all gates".** The speed gate removes slow dense models; a blanket MoE preference would have shut out the best small model found, which is dense.
+- **Full catalogue refresh** to the current generation: Qwen 3.5 / 3.6 / 3.8, Gemma 4, Granite 4.2 and Devstral Small 2, across light, daily, reasoning, coding and vision roles. Every tag was checked against the Ollama library. Existing catalogues are not overwritten; see [Upgrading from an earlier version](#upgrading-from-an-earlier-version).
+- **Fixed: decimal model sizes crashed the install.** The free-disk check used bash integer arithmetic on the catalogue's SIZE column; a size like `7.6` aborted the run under `set -e`. The comparison now uses `awk`.
+- **Tidied: free-disk probe off macOS.** The non-macOS fallback used `df -h`, whose units vary (`T`, `M`), so a large or small disk could produce a non-numeric value. It now uses `df -BG`. macOS was never affected.
+- **Hardened: padded catalogue lines.** Trimming a field no longer rejoins the line with spaces, which had broken later field lookups on hand-edited lines with spaces around the pipes.
+- **CI: live tag guard replaces the "fictional tag" blocklist.** The blocklist banned `llama3.3:70b`, which was always real, and `qwen3.6:35b-a3b`, which has since shipped. CI now fetches every shipped tag's manifest; a 404 fails the build and a registry outage is only a warning.
+- **CI: simulated-hardware tests.** Stub `sysctl`/`ioreg` executables impersonate specific chips to test the bandwidth table, both bins of every binned chip, unknown future chips, the speed gate, and representative picks.
+- **CI: `.shellcheckrc` added** as the only lint configuration. The five codes CI previously excluded on the command line never fire on the script (checked on shellcheck 0.9, 0.10 and 0.11), so none are disabled globally.
+- **Correction:** the v3.1 entry below wrongly lists `llama3.3:70b` as a non-existent tag. It has been a real Ollama tag since December 2024.
 
 ### v3.3.0
 

@@ -30,11 +30,10 @@ jobs:
       - name: Syntax check (bash -n)
         run: bash -n llmstack-macos.sh
 
-      - name: Shellcheck
+      - name: Shellcheck (configured only by .shellcheckrc)
         run: |
-          shellcheck \
-            --exclude=SC1091,SC2154,SC2317,SC2155,SC2016 \
-            -x llmstack-macos.sh
+          shellcheck --version
+          shellcheck -x llmstack-macos.sh
 
       - name: Verify shebang
         run: |
@@ -282,27 +281,139 @@ jobs:
           echo "At least one verified daily driver present"
 
       # ---------------------------------------------------------------------
-      # Regression: fictional tags must not reappear
-      # llama3.3:70b is NOT included — it is a real model tag now.
-      # Only qwen3.6:35b-a3b and gemma4:26b-a4b are known-fictional.
+      # Model selection on simulated hardware (v3.4.0)
+      # Stub sysctl and ioreg executables are put first on PATH, per command
+      # only, to impersonate specific Apple chips. Each run uses its own HOME
+      # so the main catalogue above is untouched.
       # ---------------------------------------------------------------------
-      - name: 'No fictional model tags in script'
+      - name: 'Set up hardware simulator'
         run: |
-          if grep -qE 'qwen3\.6:35b-a3b|gemma4:26b-a4b' llmstack-macos.sh; then
-            echo "FAIL: found a known-fictional model tag in the script"
-            grep -nE 'qwen3\.6:35b-a3b|gemma4:26b-a4b' llmstack-macos.sh
-            exit 1
-          fi
-          echo "No fictional tags found"
+          mkdir -p "$RUNNER_TEMP/fakebin"
+          cat > "$RUNNER_TEMP/fakebin/sysctl" <<'EOF'
+          #!/bin/bash
+          [ "$1" = "-n" ] && shift
+          case "$1" in
+            machdep.cpu.brand_string) echo "$FAKE_CHIP" ;;
+            hw.ncpu)    echo "$FAKE_NCPU" ;;
+            hw.memsize) echo $(( FAKE_RAM_GB * 1024 * 1024 * 1024 )) ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          cat > "$RUNNER_TEMP/fakebin/ioreg" <<'EOF'
+          #!/bin/bash
+          [ -n "${FAKE_GPU:-}" ] || exit 1
+          printf '  | "gpu-core-count" = %s\n' "$FAKE_GPU"
+          EOF
+          # usage: simulate CHIP NCPU RAM_GB [GPU_CORES] [CATALOG_FILE]
+          cat > "$RUNNER_TEMP/simulate.sh" <<'EOF'
+          simulate() {
+            local h; h="$(mktemp -d)"
+            if [ -n "${5:-}" ]; then
+              mkdir -p "$h/.config/llmstack"
+              cp "$5" "$h/.config/llmstack/models.catalog"
+            fi
+            HOME="$h" PATH="$RUNNER_TEMP/fakebin:$PATH" \
+              FAKE_CHIP="$1" FAKE_NCPU="$2" FAKE_RAM_GB="$3" FAKE_GPU="${4:-}" \
+              ./llmstack-macos.sh --recommend 2>&1
+            rm -rf "$h"
+          }
+          expect() { echo "$out" | grep -qE -- "$1" || { echo "FAIL [$label]: expected /$1/"; echo "$out"; exit 1; }; echo "ok   [$label] /$1/"; }
+          reject() { if echo "$out" | grep -qE -- "$1"; then echo "FAIL [$label]: unexpected /$1/"; echo "$out"; exit 1; fi; echo "ok   [$label] not /$1/"; }
+          EOF
+          chmod +x "$RUNNER_TEMP/fakebin/sysctl" "$RUNNER_TEMP/fakebin/ioreg"
 
-      - name: 'No fictional model tags in generated catalogue'
+      - name: 'Speed gate: dense models over the chip cap are skipped, MoE is exempt'
         run: |
-          if grep -qE 'qwen3\.6:35b-a3b|gemma4:26b-a4b' \
-            "$HOME/.config/llmstack/models.catalog"; then
-            echo "FAIL: found a known-fictional model tag in the catalogue"
-            exit 1
-          fi
-          echo "No fictional tags in catalogue"
+          . "$RUNNER_TEMP/simulate.sh"
+          dense="$RUNNER_TEMP/dense.catalog"
+          printf '%s\n' '# Last-Updated: 2026-09-30' \
+            '48|test-dense:70b|43|dense|daily|yes|synthetic' \
+            '8|test-small:3b|2|dense|daily|yes|synthetic' > "$dense"
+          moe="$RUNNER_TEMP/moe.catalog"
+          printf '%s\n' '# Last-Updated: 2026-09-30' \
+            '48|test-moe:70b|43|moe|daily|yes|synthetic' \
+            '8|test-small:3b|2|dense|daily|yes|synthetic' > "$moe"
+          label="M4 Pro 64GB, dense 43GB"; out="$(simulate 'Apple M4 Pro' 12 64 '' "$dense")"
+          expect 'daily: +test-small:3b$'; reject 'test-dense:70b'
+          label="M4 Max 14c 64GB (410 GB/s), dense 43GB"; out="$(simulate 'Apple M4 Max' 14 64 '' "$dense")"
+          reject 'test-dense:70b'
+          label="M4 Max 16c 64GB (546 GB/s), dense 43GB"; out="$(simulate 'Apple M4 Max' 16 64 '' "$dense")"
+          expect 'daily: +test-dense:70b$'
+          label="M4 Pro 64GB, MoE 43GB"; out="$(simulate 'Apple M4 Pro' 12 64 '' "$moe")"
+          expect 'daily: +test-moe:70b$'
+
+      - name: 'Bandwidth table: every binned chip resolves to the right bin'
+        run: |
+          . "$RUNNER_TEMP/simulate.sh"
+          bw() { label="$1 ncpu=$2 ram=$3 gpu=${4:-none}"; out="$(simulate "$1" "$2" "$3" "${4:-}")"; expect "Memory bandwidth: +$5 GB/s"; }
+          bw 'Apple M1'        8 16 ''  68
+          bw 'Apple M3 Pro'   11 36 ''  150
+          bw 'Apple M3 Max'   14 36 ''  300
+          bw 'Apple M3 Max'   16 48 ''  400
+          bw 'Apple M4 Max'   14 36 ''  410
+          bw 'Apple M4 Max'   16 64 ''  546
+          bw 'Apple M5 Max'   18 36 32  460
+          bw 'Apple M5 Max'   18 128 40 614
+          bw 'Apple M5 Max'   18 36 ''  460
+          bw 'Apple M5 Max'   18 64 ''  614
+          bw 'Apple M5 Ultra' 36 256 '' 1200
+          bw 'Apple M6'       12 16 ''  153
+          bw 'Apple M6'       12 24 ''  170
+          bw 'Apple M1 (Virtual)' 3 7 '' 68
+
+      - name: 'Unrecognised future Apple chip takes the newest known generation'
+        run: |
+          . "$RUNNER_TEMP/simulate.sh"
+          label="M7";       out="$(simulate 'Apple M7'       10 16 '')";  expect 'Memory bandwidth: +153 GB/s'
+          label="M7 Pro";   out="$(simulate 'Apple M7 Pro'   14 48 '')";  expect 'Memory bandwidth: +307 GB/s'
+          label="M7 Max";   out="$(simulate 'Apple M7 Max'   18 64 '')";  expect 'Memory bandwidth: +460 GB/s'
+          label="M7 Ultra"; out="$(simulate 'Apple M7 Ultra' 36 256 '')"; expect 'Memory bandwidth: +1200 GB/s'
+
+      - name: 'Shipped catalogue: representative picks'
+        run: |
+          . "$RUNNER_TEMP/simulate.sh"
+          label="M4 Pro 64GB"; out="$(simulate 'Apple M4 Pro' 12 64 '')"
+          expect 'daily: +qwen3.6:35b-a3b$'; expect 'reasoning: +qwen3.8:27b$'
+          label="M3 Pro 36GB (dense 27B too slow)"; out="$(simulate 'Apple M3 Pro' 11 36 '')"
+          expect 'reasoning: +gemma4:26b-a4b-it-qat$'; reject 'qwen3.8:27b'
+          label="M4 32GB"; out="$(simulate 'Apple M4' 10 32 '')"
+          expect 'daily: +gemma4:26b-a4b-it-qat$'; expect 'coding: +qwen3.5:9b$'
+          label="M1 8GB"; out="$(simulate 'Apple M1' 8 8 '')"
+          expect 'daily: +qwen3.5:4b$'; expect 'light: +granite4.2:3b$'
+
+      - name: 'Non-Apple host: sized by memory alone, no dense-speed cap'
+        run: |
+          set +e
+          output=$(./llmstack-macos.sh --recommend 2>&1)
+          echo "$output" | grep -q 'no dense-speed cap applied' \
+            || { echo "FAIL: expected no dense-speed cap on a non-Apple host"; echo "$output"; exit 1; }
+          echo "Memory-only sizing confirmed"
+
+      # ---------------------------------------------------------------------
+      # Live tag guard (replaces the old static "fictional tag" blocklist,
+      # which banned llama3.3:70b and qwen3.6:35b-a3b — both real).
+      # Runs BEFORE the registry is blackholed below. A 404 fails the job;
+      # any other status is a registry problem, reported as a warning so CI
+      # does not depend on Ollama's uptime.
+      # ---------------------------------------------------------------------
+      - name: 'Every shipped catalogue tag exists in the Ollama registry'
+        run: |
+          cat="$HOME/.config/llmstack/models.catalog"
+          dead=0; unknown=0; live=0
+          tags=$(grep -v '^#' "$cat" | grep -v '^$' \
+            | awk -F'|' '{ gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2 }' | sort -u)
+          for tag in $tags; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+              -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+              "https://registry.ollama.ai/v2/library/${tag%%:*}/manifests/${tag##*:}") || code="000"
+            case "$code" in
+              200) echo "LIVE     $tag"; live=$((live+1)) ;;
+              404) echo "::error::DEAD $tag (404: retired, renamed or never existed)"; dead=$((dead+1)) ;;
+              *)   echo "::warning::UNKNOWN $tag (HTTP $code)"; unknown=$((unknown+1)) ;;
+            esac
+          done
+          echo "Summary: $live live, $dead dead, $unknown unknown"
+          [ "$dead" -eq 0 ] || exit 1
 
       # ---------------------------------------------------------------------
       # Idempotency
@@ -418,9 +529,8 @@ jobs:
       - name: Shellcheck (brew)
         run: |
           brew install shellcheck
-          shellcheck \
-            --exclude=SC1091,SC2154,SC2317,SC2155,SC2016 \
-            -x llmstack-macos.sh
+          shellcheck --version
+          shellcheck -x llmstack-macos.sh
 
       - name: '--recommend detects real Apple Silicon hardware'
         run: |
@@ -506,14 +616,13 @@ jobs:
             | awk -F'|' '{ if (NF != 7) { printf "FAIL: %d fields: %s\n", NF, $0; exit 1 } }'
           echo "Catalogue valid"
 
-      - name: 'No fictional tags in macOS-generated catalogue'
+      - name: '--recommend reports a memory bandwidth for the real chip'
         run: |
-          if grep -qE 'qwen3\.6:35b-a3b|gemma4:26b-a4b' \
-            "$HOME/.config/llmstack/models.catalog"; then
-            echo "FAIL: fictional tag in catalogue"
-            exit 1
-          fi
-          echo "No fictional tags"
+          set +e
+          output=$(./llmstack-macos.sh --recommend 2>&1)
+          echo "$output" | grep -E 'Chip:|Memory bandwidth:|Dense model cap:'
+          echo "$output" | grep -qE 'Memory bandwidth: +[0-9]+ GB/s' \
+            || { echo "FAIL: no bandwidth resolved for this Apple Silicon chip"; exit 1; }
 
   # ===========================================================================
   # Summary job — useful for branch protection rules

@@ -1,0 +1,21 @@
+# shellcheck configuration for llmstack-macos.sh
+#
+# CI runs plain `shellcheck -x llmstack-macos.sh`, so this file is the only
+# lint configuration and a local run behaves exactly like CI.
+#
+# No checks are disabled globally. As of v3.4.0 the script is clean with
+# every check enabled on shellcheck 0.9.0, 0.10.0 and 0.11.0. Its known
+# false positives are suppressed at the exact line, where the reason sits
+# next to the code:
+#
+#   SC2016  STATUS_BODY and the `brew shellenv` line are single-quoted on
+#           purpose: expansion must happen later, in the user's shell.
+#   SC1091  `source=/dev/null` on the config file, which is written at
+#           install time and cannot be followed statically.
+#
+# Only add a global `disable=` here for a code that fires across the whole
+# file, with a comment explaining why it is a false positive. A global
+# disable hides every future instance, including real bugs.
+
+# Follow `source` directives without needing -x on every invocation.
+external-sources=true
