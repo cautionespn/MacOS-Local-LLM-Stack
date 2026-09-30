@@ -64,14 +64,15 @@ Options: `--searxng-url URL`, `--searxng-port PORT`, `--webui-port PORT`, `--mod
 
 ## 7. Model selection
 
-- Detect chip, tier (Base/Pro/Max/Ultra), memory, and free disk.
+- Detect chip, tier (Base/Pro/Max/Ultra), memory, memory bandwidth, and free disk.
 - Budget roughly 70% of unified memory for weights.
-- Select against a catalogue on **two independent gates**: size must fit the budget, *and* the entry's declared minimum machine class must be met. Fitting and running well are different things — a dense 70B fits a 64 GB budget and performs badly on Pro-tier bandwidth.
-- Prefer MoE over dense where both fit. Generation is memory-bandwidth-bound; MoE activates a fraction of parameters per token.
+- Select against a catalogue on **three independent gates**: size must fit the budget; the entry's declared minimum machine class (MIN_RAM) must be met; and a **dense** entry must be small enough for the chip's memory bandwidth to generate at a usable speed. Fitting and running well are different things — a dense 70B fits a 64 GB budget and performs badly on Pro-tier bandwidth.
+- **Bandwidth gate.** Look up the chip's memory bandwidth from a per-chip table keyed on the `machdep.cpu.brand_string` value. Dense cap (GB) = bandwidth × 0.65 realised efficiency ÷ 8 tok/s minimum; keep both numbers as named constants. MoE entries are exempt: only their active experts are read per token. Where one chip name has two bandwidth bins, disambiguate: M3 Max and M4 Max by `hw.ncpu` (14 vs 16); M5 Max by GPU core count from `ioreg` (32 vs 40), falling back to memory size (36 GB = lower bin); M6 by memory size (16 GB = lower bin). An unrecognised Apple chip uses the newest known generation's lower bin for its tier. A non-Apple chip (CI) has no bandwidth gate and is sized by memory alone.
+- **Among entries that pass all three gates, the largest wins.** The bandwidth gate is how MoE is preferred: it removes dense models exactly where bandwidth would make them slow. Do not hard-prefer MoE beyond that — a dense model that passes the gate may be markedly better than any MoE that fits (v3.4.0 finding: `qwen3.8:27b` dense vs `qwen3.6:35b-a3b` MoE). The catalogue is curated so that, within a role, size tracks quality; do not ship multiple quantizations of one model, since "largest wins" would always pick the heaviest.
 - Fall back to a lighter tier rather than recommending nothing.
 - Warn when free disk is short of the model size plus headroom.
 - **Use only real, currently-available model tags.** Verify every tag against the Ollama registry (https://ollama.com/library) before marking it `yes` in the VERIFIED column. Do not invent or speculate about model names, sizes, or tags. If unsure, mark the tag `no` and note it. Tags that don't exist will fail to pull and undermine trust in the script.
-- A regression guard is valuable: the CI workflow must check that known-fictional tags (e.g. `qwen3.6:35b-a3b`, `gemma4:26b-a4b`, `llama3.3:70b`) do not appear in the script or the generated catalogue.
+- Guard against dead tags with a **live manifest check in CI**, not a static blocklist. A blocklist of "known-fictional" tags ages badly: `llama3.3:70b` was listed as fictional but was always real, and `qwen3.6:35b-a3b` was fictional when listed and later shipped.
 
 ## 8. Catalogue file
 
@@ -80,7 +81,8 @@ Options: `--searxng-url URL`, `--searxng-port PORT`, `--webui-port PORT`, `--mod
 - Header carries `# Last-Updated: YYYY-MM-DD`.
 - The script parses that date and grades staleness: recent under 90 days, worth reviewing at 90–180, very likely stale beyond 180. Report this in `--update` and `--recommend`.
 - Mark each tag verified or unverified. **Mark a tag verified only if you actually confirmed it against the Ollama registry in this session.** Warn before pulling anything unverified; on pull failure, point at the library and continue rather than aborting.
-- Include entries across multiple roles: daily, coding, vision, light. Ensure at least one verified daily-driver entry exists.
+- Include entries across multiple roles: daily, reasoning, coding, vision, light. Ensure at least one verified daily-driver entry exists.
+- SIZE may be a decimal (e.g. `7.6`). Never feed a catalogue value to bash integer arithmetic or `[ -lt ]`; compare in `awk`, which also tolerates hand-edited values.
 - The CI workflow must validate the catalogue format: 7 pipe-delimited fields per data line, VERIFIED column is `yes` or `no`, ARCH column is `moe` or `dense`, ROLE column is one of the known values, and at least one verified daily driver is present.
 
 ## 9. Platform constraints to handle, not discover
@@ -146,7 +148,7 @@ Provide `.github/workflows/ci.yml` and `.shellcheckrc` that:
 
 ### Lint job (Ubuntu, fast)
 - `bash -n` syntax check.
-- `shellcheck -x` with the `.shellcheckrc` suppressing `SC1091` (non-constant source), `SC2154` (false positives from `eval`'d `STATUS_BODY`), `SC2317` (unreachable command false positives in trap/eval blocks).
+- `shellcheck -x` configured only by `.shellcheckrc` — no `--exclude` on the command line, so local runs and CI agree. The rc file disables only codes that actually fire on the script, each with a comment saying why it is a false positive. Establish the list by running shellcheck, not from memory.
 - Verify the shebang is `#!/bin/bash`.
 
 ### CLI test job (Ubuntu)
@@ -158,11 +160,12 @@ Provide `.github/workflows/ci.yml` and `.shellcheckrc` that:
 - `--recommend` produces a "DETECTED SYSTEM" header, writes the catalogue, reports catalogue age, and does not overwrite an existing catalogue (test by corrupting the date line, re-running, and verifying it survives).
 - `--status` shows Ollama, Open WebUI, and SearXNG lines.
 - Catalogue format validation: 7 pipe-delimited fields, valid tag format (`[a-zA-Z0-9._:-]+`), VERIFIED column is `yes`/`no`, ARCH column is `moe`/`dense`, ROLE column is one of the known values, at least one verified daily driver.
-- Regression guard: known-fictional tags (`qwen3.6:35b-a3b`, `gemma4:26b-a4b`, `llama3.3:70b`) do not appear in the script or the generated catalogue.
+- Live tag guard: before the registry is blackholed, fetch the manifest of every tag in the generated catalogue. A 404 fails the job. Any other non-200 (registry outage) is a warning, not a failure, so CI is not held hostage to Ollama's uptime.
+- Simulated-hardware selection tests: put stub `sysctl` and `ioreg` executables first on `PATH` to impersonate specific chips, run `--recommend` under an isolated `HOME`, and assert the bandwidth figure and the picks. Cover at least: a Pro chip that must not get a dense model over its cap; a Max chip that may; both bins of M3 Max, M4 Max, M5 Max and M6; an unrecognised future Apple chip; and a non-Apple host (memory-only sizing).
 - Idempotency: `--recommend` produces identical output on consecutive runs.
 - Catalogue-maintenance modes are offline-safe: with no registry access (the CI condition), `--check-models`, `--refresh-catalog`, and `--refresh-catalog-apply` must each exit 0, must not write `models.catalog.proposed`, and must leave the live catalogue byte-for-byte unchanged. Verify the live catalogue is identical before and after.
 - `--help` mentions the new modes (`--check-models`, `--refresh-catalog`, `--refresh-catalog-apply`) and the `--discover` option.
-- The network-dependent behaviour of these modes (actual proposal generation) is exercised only on the conditional macOS job or via `workflow_dispatch`, never in the network-less Ubuntu job.
+- The network-dependent behaviour of these modes (actual proposal generation) is exercised only on the conditional macOS job or via `workflow_dispatch`. GitHub-hosted runners do have internet, so the Ubuntu job must blackhole `registry.ollama.ai` and `ollama.com` in `/etc/hosts` before the offline-safety steps, and run the live tag guard before that.
 
 ### macOS test job (Apple Silicon, conditional)
 - Only runs on pushes to `main` or manual `workflow_dispatch`, to conserve macOS runner minutes (billed at 10x rate).
@@ -180,3 +183,5 @@ Provide `.github/workflows/ci.yml` and `.shellcheckrc` that:
 <!-- Append refinements and new requirements below. Reference the section
      being amended, e.g. "§6: add a --dry-run mode that prints every
      command it would execute and exits." -->
+
+- **v3.4.0 (2026-09-30)** — amended in place rather than appended: §7 (three gates, per-chip bandwidth table, largest-wins instead of MoE-first, live tag guard replacing the fictional-tag blocklist), §8 (reasoning role, decimal sizes), §14 (`.shellcheckrc` as sole lint config, live tag guard, simulated-hardware tests, runners have internet).
