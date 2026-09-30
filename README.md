@@ -24,6 +24,7 @@ Inference, a web front-end, and private web search — all running locally, all 
 - [Startup behaviour, and one real limitation](#startup-behaviour-and-one-real-limitation)
 - [Remote SearXNG](#remote-searxng)
 - [Shell commands](#shell-commands)
+- [Syncing models](#syncing-models)
 - [Updating](#updating)
 - [Uninstalling](#uninstalling)
 - [File layout](#file-layout)
@@ -93,6 +94,7 @@ Finally, turn on web search: **Admin → Settings → Web Search**, set *Enable*
 | `--update` | Update Ollama, Open WebUI, and the SearXNG image. Backs up data first, then reports how stale the model catalogue has become. `--upgrade` is a synonym. |
 | `--status` | Print component health. Changes nothing. |
 | `--recommend` | Print detected hardware and suitable models. Installs nothing. |
+| `--sync-models` | Pull the recommended models you choose, then offer each other installed model for removal. Interactive; every prompt defaults to no. See [Syncing models](#syncing-models). |
 | `--uninstall` | Guided teardown, confirming every step. |
 | `--check-models` | Validate every catalogue tag against the Ollama registry and fix the VERIFIED column in place. |
 | `--refresh-catalog` | Write `models.catalog.proposed` — revalidated tags plus newer variants in your families. Never touches the live file. Add `--discover` to also scan for new families. |
@@ -241,15 +243,16 @@ Every tag was checked on [ollama.com/library](https://ollama.com/library) on 202
 
 ### Upgrading from an earlier version
 
-Your existing catalogue is never overwritten, so after upgrading the script you keep the old model list. The new bandwidth gate applies to it immediately, but you won't see the new models until you regenerate the file:
+Your existing catalogue is never overwritten silently, so after upgrading the script you keep the old model list. The bandwidth gate applies to it immediately, but the new models won't appear until the file is refreshed. The easy way is `--sync-models`: when your catalogue is older than the one built into the script, it offers to back yours up and replace it, then walks you through pulling the new picks.
+
+To do it by hand instead:
 
 ```bash
 mv ~/.config/llmstack/models.catalog ~/.config/llmstack/models.catalog.pre-3.4
-./llmstack-macos.sh --update       # brings Ollama current enough for newer model families
-./llmstack-macos.sh --recommend    # writes the v3.4.0 catalogue and shows the picks
+./llmstack-macos.sh --recommend    # writes the current built-in catalogue and shows the picks
 ```
 
-Copy any hand-added rows across from the `.pre-3.4` file afterwards.
+Either way, copy any rows you added yourself back from the backup afterwards.
 
 ### Keeping the catalogue current
 
@@ -383,6 +386,31 @@ Settings are read from `~/.config/llmstack/config` at call time, not baked into 
 The block is delimited by start and end markers. Re-running the installer **replaces** it rather than appending a second copy, backing up `.zshrc` first, and it recognises markers written by earlier versions of this tooling.
 
 > **Use `exec zsh`, not `source ~/.zshrc`.** Sourcing cannot clear definitions already resident in a running shell. If an older install defined these as aliases, sourcing the new file mid-session produces `defining function based on alias` followed by a parse error. See [Troubleshooting](#defining-function-based-on-alias-llmstop--parse-error-in-zshrc).
+
+---
+
+## Syncing models
+
+```bash
+./llmstack-macos.sh --sync-models
+```
+
+`--recommend` tells you what suits the machine; `--sync-models` makes the installed models match it. With Ollama running, it:
+
+1. **Offers to refresh an out-of-date catalogue.** If yours is older than the one built into the script, it explains why and offers to back it up and replace it.
+2. **Shows the current picks**, each with its roles, size, and whether it's already installed.
+3. **Asks which missing picks to pull**, once per model. A model serving several roles is asked about once.
+4. **Checks free disk** against the chosen downloads plus 10 GB of headroom, and stops with nothing changed if it's short.
+5. **Pulls everything you chose.** If any pull fails, nothing is removed.
+6. **Only then offers each other installed model for removal, one at a time.** Embedding models get an explicit warning, because Open WebUI may use them for document search.
+
+Every prompt defaults to no, so pressing Enter never downloads or deletes anything. A pick you decline to pull is never offered for removal — it's still a recommendation.
+
+Old and new models coexist until the removal step, so you need room for both. If there isn't room, run it once declining every pull and remove what you don't need, then run it again to pull.
+
+The size shown for each pick is its full download. Tags that share weights (like `qwen3.6:35b-a3b` and `qwen3.6:35b-a3b-coding`) are counted twice by the disk check, though Ollama stores the weights once — the check errs on the side of caution.
+
+If you remove the model Open WebUI uses as its default, choose a new default there. Existing chats remain readable.
 
 ---
 
@@ -736,6 +764,13 @@ A few choices worth explaining, since they're the ones people tend to want to ch
 ---
 
 ## Changelog
+
+### v3.5.0
+
+- **New `--sync-models` mode.** Pulls the recommended models you choose, then offers every installed model that is no longer a pick for removal, one at a time. Pulls always finish before any removal, a failed pull blocks all removals, free disk is checked before anything is downloaded, and every prompt defaults to no. Embedding models are flagged before you remove them. See [Syncing models](#syncing-models).
+- **Catalogue upgrade built in.** `--sync-models` detects a live catalogue older than the script's built-in one and offers to back it up and replace it, replacing the manual upgrade steps from v3.4.0.
+- **`--recommend` points to `--sync-models`**, and remains read-only.
+- **CI:** stub `ollama` and `df` executables test the sync logic with no network. The cases cover pulls and removals matching the answers given, pull-before-remove ordering, failed-pull safety, a stopped daemon, stale-catalogue refresh, and a disk shortfall.
 
 ### v3.4.0
 

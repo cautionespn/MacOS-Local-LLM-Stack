@@ -47,13 +47,23 @@ Install Homebrew, Python 3.11, and a container runtime only as needed. Prefer pi
 
 ## 6. Modes and CLI
 
-Modes: `--install` (default), `--update` (alias `--upgrade`), `--status`, `--recommend`, `--uninstall`, `--version`, `--check-models`, `--refresh-catalog`, `--refresh-catalog-apply`, `--help`.
+Modes: `--install` (default), `--update` (alias `--upgrade`), `--status`, `--recommend`, `--sync-models`, `--uninstall`, `--version`, `--check-models`, `--refresh-catalog`, `--refresh-catalog-apply`, `--help`.
 
 Options: `--searxng-url URL`, `--searxng-port PORT`, `--webui-port PORT`, `--model TAG`, `--no-model`, `--no-drawthings`, `--discover` (refresh modes only).
 
 - `--help` is comprehensive: synopsis, every mode and option, components, file layout, ports, startup behaviour *and its limits*, security note about the plist secret key, requirements, post-install steps, exit status, examples.
 - `--version` prints the script name and version, then exits 0.
-- `--recommend` and `--status` are read-only. They must install, download, and change nothing.
+- `--recommend` and `--status` are read-only. They must install, download, and change nothing. `--recommend` ends by pointing at `--sync-models`.
+- `--sync-models` brings the installed Ollama models in line with the recommendations. It is interactive and changes nothing without a yes:
+  1. Require a running Ollama daemon (`ollama list` succeeds); otherwise say so and exit 1 with nothing changed.
+  2. If the live catalogue's `Last-Updated` is older than the catalogue built into the script, explain and offer (default no) to back it up with a timestamp and replace it with the built-in one, before computing picks.
+  3. Compute each role's pick. Show every pick with its roles, size, and whether it is installed. Treat a tag with no `:` as `:latest` when comparing.
+  4. For each pick not yet installed, ask once per unique tag (listing every role it serves) whether to pull it. Default no.
+  5. Before pulling, check free disk against the selected downloads plus 10 GB of headroom. If short, stop with nothing changed, and say that running again and declining all pulls lets you do the removals first.
+  6. Pull everything selected (trap Ctrl-C as in §10.11). If any pull fails, remove nothing, report the failures, and exit 1.
+  7. Only then, for each installed model that is not any role's current pick, ask separately whether to remove it. Default no. A model whose `ollama show` capabilities include embedding gets an explicit warning that Open WebUI may use it for document search.
+  8. Print a summary of what was pulled, removed, and kept, and remind the user to reselect a default model in Open WebUI if they removed one.
+  Declining a role's pull never makes that role's current pick a removal candidate.
 - `--uninstall` confirms **each artifact separately**. Every prompt defaults to no; bare Enter skips. Destroying user data takes two confirmations.
 - `--uninstall` never removes shared dependencies (Homebrew, Python, `mas`). Say so in the summary.
 - `--update` backs up user data before touching anything, and restarts the stack even if an upgrade step fails.
@@ -161,6 +171,7 @@ Provide `.github/workflows/ci.yml` and `.shellcheckrc` that:
 - `--status` shows Ollama, Open WebUI, and SearXNG lines.
 - Catalogue format validation: 7 pipe-delimited fields, valid tag format (`[a-zA-Z0-9._:-]+`), VERIFIED column is `yes`/`no`, ARCH column is `moe`/`dense`, ROLE column is one of the known values, at least one verified daily driver.
 - Live tag guard: before the registry is blackholed, fetch the manifest of every tag in the generated catalogue. A 404 fails the job. Any other non-200 (registry outage) is a warning, not a failure, so CI is not held hostage to Ollama's uptime.
+- `--sync-models` tests with stub `ollama` and `df` executables on `PATH`, answers fed on stdin, and a log of stub calls: selected pulls happen and declined ones don't; removals happen only for models answered yes; a current pick is never offered for removal; an embedding model gets its warning; a failed pull prevents every removal; a stopped daemon exits 1 with no calls; a stale catalogue is backed up and replaced only on yes; a disk shortfall stops before any pull.
 - Simulated-hardware selection tests: put stub `sysctl` and `ioreg` executables first on `PATH` to impersonate specific chips, run `--recommend` under an isolated `HOME`, and assert the bandwidth figure and the picks. Cover at least: a Pro chip that must not get a dense model over its cap; a Max chip that may; both bins of M3 Max, M4 Max, M5 Max and M6; an unrecognised future Apple chip; and a non-Apple host (memory-only sizing).
 - Idempotency: `--recommend` produces identical output on consecutive runs.
 - Catalogue-maintenance modes are offline-safe: with no registry access (the CI condition), `--check-models`, `--refresh-catalog`, and `--refresh-catalog-apply` must each exit 0, must not write `models.catalog.proposed`, and must leave the live catalogue byte-for-byte unchanged. Verify the live catalogue is identical before and after.
@@ -184,4 +195,5 @@ Provide `.github/workflows/ci.yml` and `.shellcheckrc` that:
      being amended, e.g. "§6: add a --dry-run mode that prints every
      command it would execute and exits." -->
 
+- **v3.5.0 (2026-09-30)** — §6: `--sync-models` (pull chosen picks, then offer per-model removal of everything that is not a current pick) and the `--recommend` pointer to it; §14: stubbed-`ollama` sync tests.
 - **v3.4.0 (2026-09-30)** — amended in place rather than appended: §7 (three gates, per-chip bandwidth table, largest-wins instead of MoE-first, live tag guard replacing the fictional-tag blocklist), §8 (reasoning role, decimal sizes), §14 (`.shellcheckrc` as sole lint config, live tag guard, simulated-hardware tests, runners have internet).

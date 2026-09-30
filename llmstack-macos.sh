@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# llmstack-macos.sh  v3.4.0
+# llmstack-macos.sh  v3.5.0
 #
 # A self-contained, private LLM stack for macOS on Apple Silicon.
 #
@@ -22,7 +22,7 @@ set -euo pipefail
 # Constants
 # ---------------------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="3.4.0"
+SCRIPT_VERSION="3.5.0"
 CATALOG_DATE="2026-09-30"
 CATALOG_WARN_DAYS=90
 CATALOG_STALE_DAYS=180
@@ -863,7 +863,9 @@ SYSINFO2
   fi
   report_catalog_age
   printf 'Catalogue file: %s\n' "$CATALOG"
-  printf 'Edit it to change these recommendations.\n\n'
+  printf 'Edit it to change these recommendations.\n'
+  printf 'To pull these picks and review removal of other installed models:\n'
+  printf '  %s --sync-models\n\n' "$SCRIPT_NAME"
 }
 
 # ===========================================================================
@@ -923,6 +925,12 @@ MODES
     --recommend     Print the detected hardware and the models that suit
                     it, then exit. Installs nothing. Useful before
                     committing to a large download.
+    --sync-models   Bring installed models in line with the
+                    recommendations. Offers to refresh an out-of-date
+                    catalogue, asks which missing picks to pull, pulls
+                    them, and only then offers each installed model that
+                    is not a current pick for removal, one at a time.
+                    Every prompt defaults to no. Needs Ollama running.
     --uninstall     Guided teardown. Walks every artifact the script
                     created and asks before removing each one. All
                     destructive prompts default to NO.
@@ -1402,6 +1410,198 @@ SUMMARY
 }
 
 # ===========================================================================
+# SYNC MODELS
+# ===========================================================================
+# Brings installed Ollama models in line with the recommendations. Order is
+# the safety property: every chosen pull must succeed before anything is
+# removed, so a failed or interrupted run never leaves fewer models than it
+# started with. Every change needs a yes; every prompt defaults to no.
+#
+# Prompts read from stdin, so loops that prompt iterate over fd 3 instead;
+# a plain `while read ... done <<< list` would feed the list to confirm().
+
+# "name" and "name:latest" are the same model to Ollama.
+_model_norm() { case "$1" in *:*) printf '%s' "$1" ;; *) printf '%s:latest' "$1" ;; esac; }
+
+# True if the newline-separated list $1 contains the exact line $2.
+_has_line() { printf '%s\n' "$1" | grep -qxF -- "$2"; }
+
+# True if `ollama show` lists an embedding capability. Fail-soft: an Ollama
+# without a Capabilities section simply reports false.
+_is_embedding_model() {
+  ollama show "$1" 2>/dev/null \
+    | awk 'tolower($0) ~ /capabilities/ { f = 1; next } f && /^[[:space:]]*$/ { f = 0 } f' \
+    | grep -qi 'embedding'
+}
+
+sync_models() {
+  local listing inst="" m live_date role line rows="" picks picktags sel="" cands=""
+  local tag size arch roles st need sz pulled="" failed="" removed="" kept=""
+  detect_system
+  ensure_catalog
+  cat <<'SYNCHDR'
+===========================================================================
+  SYNC MODELS
+===========================================================================
+  Pulls the recommended models you choose, then offers each installed
+  model that is not a current pick for removal. Nothing is removed until
+  every chosen pull has succeeded. All prompts default to NO.
+===========================================================================
+SYNCHDR
+
+  # 1. The daemon must be up: both pull and rm go through it.
+  if ! listing="$(ollama list 2>/dev/null)"; then
+    error "Cannot reach Ollama. Start the stack (llmstart), then re-run. Nothing was changed."
+  fi
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    inst="${inst}$(_model_norm "$m")"$'\n'
+  done <<EOF_LIST
+$(printf '%s\n' "$listing" | awk 'NR > 1 && NF { print $1 }')
+EOF_LIST
+
+  # 2. An older live catalogue hides newer models from the picks.
+  live_date="$(catalog_date)"
+  if [ -n "$live_date" ] && [[ "$live_date" < "$CATALOG_DATE" ]]; then
+    printf '\nYour model catalogue is dated %s; this script ships one dated %s.\n' "$live_date" "$CATALOG_DATE"
+    echo "    Picks come from your catalogue, so newer models will not appear"
+    echo "    until it is refreshed. Replacing it keeps a timestamped backup;"
+    echo "    copy any rows you added by hand back from that file afterwards."
+    if confirm "Back up your catalogue and replace it with the built-in one?"; then
+      cp "$CATALOG" "${CATALOG}.backup-$(date +%Y%m%d-%H%M%S)"
+      write_default_catalog
+      ok "Catalogue replaced. Backup kept alongside it."
+    else
+      log "Keeping your catalogue."
+    fi
+  fi
+
+  # 3. Current picks, one line per unique tag with every role it serves.
+  for role in daily reasoning coding vision light; do
+    line="$(best_for_role "$role")"
+    [ -n "$line" ] || continue
+    rows="${rows}$(_model_norm "$(field "$line" 2)")|$(field "$line" 3)|$(field "$line" 4)|${role}"$'\n'
+  done
+  picks="$(printf '%s' "$rows" | awk -F'|' '
+    NF < 4 { next }
+    !($1 in r) { order[++n] = $1; size[$1] = $2; arch[$1] = $3; r[$1] = $4; next }
+    { r[$1] = r[$1] ", " $4 }
+    END { for (i = 1; i <= n; i++) print order[i] "|" size[order[i]] "|" arch[order[i]] "|" r[order[i]] }')"
+  if [ -z "$picks" ]; then
+    warn "Nothing in the catalogue fits this machine, so there is nothing to sync."
+    echo "    Run --recommend for details."
+    exit 0
+  fi
+  picktags="$(printf '%s\n' "$picks" | cut -d'|' -f1)"
+
+  printf '\nCurrent picks for this machine (%s GB, %s):\n' "$SYS_RAM_GB" "$SYS_CHIP"
+  while IFS='|' read -r tag size arch roles; do
+    [ -n "$tag" ] || continue
+    if _has_line "$inst" "$tag"; then st="installed"; else st="not installed"; fi
+    printf '  %-30s %6s GB  %-5s  %-13s  %s\n' "$tag" "$size" "$arch" "$st" "$roles"
+  done <<< "$picks"
+
+  # 4. Choose which missing picks to pull.
+  while IFS='|' read -r tag size arch roles <&3; do
+    [ -n "$tag" ] || continue
+    _has_line "$inst" "$tag" && continue
+    if confirm "Pull $tag (about $size GB) for: $roles?"; then
+      sel="${sel}${tag}|${size}"$'\n'
+    fi
+  done 3<<< "$picks"
+
+  # Removal candidates: installed, and not any role's current pick. A pick
+  # you declined to pull stays a pick, so it is never offered for removal.
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    _has_line "$picktags" "$m" || cands="${cands}${m}"$'\n'
+  done <<< "$inst"
+
+  if [ -z "$sel" ] && [ -z "$cands" ]; then
+    printf '\nNothing to do: no pulls chosen and no other models installed.\n\n'
+    exit 0
+  fi
+
+  # 5. Old and new models coexist until the removals, so check up front.
+  if [ -n "$sel" ]; then
+    need="$(printf '%s' "$sel" | awk -F'|' 'NF { s += $2 } END { printf "%d", s + 10.999 }')"
+    if awk -v f="$SYS_DISK_FREE_GB" -v w="$need" 'BEGIN { exit !(f + 0 < w + 0) }'; then
+      warn "Only ${SYS_DISK_FREE_GB} GB free; the chosen downloads need about ${need} GB including 10 GB headroom."
+      echo "    Nothing was changed. To free space first, run --sync-models again,"
+      echo "    decline every pull, and answer yes to the removals you want."
+      exit 1
+    fi
+  fi
+
+  # 6. Pull everything chosen before removing anything.
+  if [ -n "$sel" ]; then
+    trap 'warn "Pull interrupted. Nothing was removed. Re-run to resume the download."; exit 1' INT
+    while IFS='|' read -r tag size <&3; do
+      [ -n "$tag" ] || continue
+      log "Pulling $tag (about $size GB). Large downloads take a while."
+      if ollama pull "$tag"; then
+        pulled="${pulled}${tag}"$'\n'
+        ok "Pulled $tag"
+      else
+        failed="${failed}${tag}"$'\n'
+        warn "The pull failed for $tag"
+      fi
+    done 3<<< "$sel"
+    trap - INT
+    if [ -n "$failed" ]; then
+      warn "Some pulls failed, so no models were removed:"
+      printf '%s' "$failed" | sed 's/^/      /'
+      echo "    Check the tag at https://ollama.com/library and your network, then re-run."
+      exit 1
+    fi
+  fi
+
+  # 7. Offer each non-pick for removal, one at a time.
+  if [ -n "$cands" ]; then
+    printf '\n%s installed model(s) are not a current pick. Each is offered\n' "$(printf '%s' "$cands" | grep -c .)"
+    printf 'for removal separately; pressing Enter keeps it.\n'
+    while IFS= read -r m <&3; do
+      [ -n "$m" ] || continue
+      sz="$(printf '%s\n' "$listing" | awk -v m="$m" 'NR > 1 { n = $1; if (n !~ /:/) n = n ":latest"; if (n == m) { print $3 " " $4; exit } }')"
+      printf '\n  %s  (%s)\n' "$m" "${sz:-size unknown}"
+      if _is_embedding_model "$m"; then
+        printf '  %sEmbedding model.%s Open WebUI may use it for document search;\n' "$C_YELLOW" "$C_RESET"
+        printf '  removing it can break uploads and knowledge collections.\n'
+      fi
+      if confirm "Remove $m?"; then
+        if ollama rm "$m" >/dev/null; then
+          removed="${removed}${m}"$'\n'
+          ok "Removed $m"
+        else
+          kept="${kept}${m}"$'\n'
+          warn "Could not remove $m"
+        fi
+      else
+        kept="${kept}${m}"$'\n'
+      fi
+    done 3<<< "$cands"
+  fi
+
+  # 8. Summary.
+  cat <<'SYNCDONE'
+
+===========================================================================
+  SYNC COMPLETE
+===========================================================================
+SYNCDONE
+  printf '  Pulled:\n';  if [ -n "$pulled" ];  then printf '%s' "$pulled"  | sed 's/^/    /'; else echo "    (none)"; fi
+  printf '  Removed:\n'; if [ -n "$removed" ]; then printf '%s' "$removed" | sed 's/^/    /'; else echo "    (none)"; fi
+  printf '  Kept, not a current pick:\n'; if [ -n "$kept" ]; then printf '%s' "$kept" | sed 's/^/    /'; else echo "    (none)"; fi
+  if [ -n "$removed" ]; then
+    echo ""
+    echo "  If a removed model was the default in Open WebUI, choose a new"
+    echo "  default there. Existing chats remain readable."
+  fi
+  echo "==========================================================================="
+  echo ""
+}
+
+# ===========================================================================
 # SEARXNG CONTAINER
 # ===========================================================================
 start_searxng_container() {
@@ -1431,6 +1631,7 @@ while [ $# -gt 0 ]; do
     --update|--upgrade) MODE="update" ;;
     --status)       MODE="status" ;;
     --recommend)    MODE="recommend" ;;
+    --sync-models)  MODE="sync-models" ;;
     --uninstall)    MODE="uninstall" ;;
     --check-models) MODE="check-models" ;;
     --refresh-catalog)       MODE="refresh-catalog" ;;
@@ -1466,6 +1667,7 @@ done
 case "$MODE" in
   status)    show_status ;;
   recommend) show_recommendations; exit 0 ;;
+  sync-models) sync_models; exit 0 ;;
   uninstall) uninstall_stack ;;
   update)    do_update ;;
   check-models)          validate_catalog_tags fix; exit 0 ;;

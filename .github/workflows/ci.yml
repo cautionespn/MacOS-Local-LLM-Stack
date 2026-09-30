@@ -65,7 +65,7 @@ jobs:
       - name: '--help mentions all modes'
         run: |
           output=$(./llmstack-macos.sh --help)
-          for mode in --install --update --status --recommend --uninstall --version --help; do
+          for mode in --install --update --status --recommend --sync-models --uninstall --version --help; do
             echo "$output" | grep -q -- "$mode" \
               || { echo "FAIL: --help does not mention $mode"; exit 1; }
           done
@@ -317,10 +317,62 @@ jobs:
               ./llmstack-macos.sh --recommend 2>&1
             rm -rf "$h"
           }
+          # usage: FAKE_* env set by caller; sync CHIP NCPU RAM_GB ANSWERS [CATALOG_FILE]
+          # ANSWERS is one y/n per prompt, space-separated, fed on stdin.
+          sync() {
+            local h; h="$(mktemp -d)"
+            if [ -n "${5:-}" ]; then
+              mkdir -p "$h/.config/llmstack"
+              cp "$5" "$h/.config/llmstack/models.catalog"
+            fi
+            : > "$RUNNER_TEMP/ollama.log"
+            # Not called inside $(...): SYNC_RC, SYNC_HOME and out must reach the step.
+            SYNC_RC=0
+            printf '%s\n' $4 | HOME="$h" PATH="$RUNNER_TEMP/fakebin:$PATH" \
+              FAKE_CHIP="$1" FAKE_NCPU="$2" FAKE_RAM_GB="$3" FAKE_GPU="" \
+              FAKE_DISK_GB="${FAKE_DISK_GB:-500}" \
+              FAKE_OLLAMA_LOG="$RUNNER_TEMP/ollama.log" \
+              ./llmstack-macos.sh --sync-models > "$RUNNER_TEMP/sync.out" 2>&1 || SYNC_RC=$?
+            SYNC_HOME="$h"
+            out="$(cat "$RUNNER_TEMP/sync.out")"
+            echo "$out"
+          }
+          called()     { grep -qxF -- "$1" "$RUNNER_TEMP/ollama.log" || { echo "FAIL [$label]: expected ollama call '$1'"; cat "$RUNNER_TEMP/ollama.log"; exit 1; }; echo "ok   [$label] called '$1'"; }
+          not_called() { if grep -qxF -- "$1" "$RUNNER_TEMP/ollama.log"; then echo "FAIL [$label]: unexpected ollama call '$1'"; exit 1; fi; echo "ok   [$label] not called '$1'"; }
           expect() { echo "$out" | grep -qE -- "$1" || { echo "FAIL [$label]: expected /$1/"; echo "$out"; exit 1; }; echo "ok   [$label] /$1/"; }
           reject() { if echo "$out" | grep -qE -- "$1"; then echo "FAIL [$label]: unexpected /$1/"; echo "$out"; exit 1; fi; echo "ok   [$label] not /$1/"; }
           EOF
-          chmod +x "$RUNNER_TEMP/fakebin/sysctl" "$RUNNER_TEMP/fakebin/ioreg"
+          cat > "$RUNNER_TEMP/fakebin/ollama" <<'EOF'
+          #!/bin/bash
+          echo "$*" >> "$FAKE_OLLAMA_LOG"
+          case "$1" in
+            list)
+              [ -z "${FAKE_OLLAMA_DOWN:-}" ] || { echo "Error: could not connect to ollama" >&2; exit 1; }
+              echo "NAME                      ID              SIZE      MODIFIED"
+              for m in ${FAKE_OLLAMA_MODELS:-}; do echo "$m    0123456789ab    4.1 GB    2 weeks ago"; done ;;
+            pull)
+              case " ${FAKE_PULL_FAIL:-} " in *" $2 "*) echo "Error: pull failed" >&2; exit 1 ;; esac ;;
+            rm) echo "deleted '$2'" ;;
+            show)
+              case " ${FAKE_EMBED:-} " in
+                *" $2 "*) printf '  Capabilities\n    embedding\n\n' ;;
+                *)        printf '  Capabilities\n    completion\n\n' ;;
+              esac ;;
+          esac
+          EOF
+          cat > "$RUNNER_TEMP/fakebin/df" <<'EOF'
+          #!/bin/bash
+          if [ -n "${FAKE_DISK_GB:-}" ] && [ "$1" = "-g" ]; then
+            echo "Filesystem 1G-blocks Used Available Capacity Mounted"
+            echo "/dev/disk1 1000 900 $FAKE_DISK_GB 90% /"
+          elif [ "$1" = "-g" ]; then
+            exit 1
+          else
+            exec /bin/df "$@"
+          fi
+          EOF
+          chmod +x "$RUNNER_TEMP/fakebin/sysctl" "$RUNNER_TEMP/fakebin/ioreg" \
+            "$RUNNER_TEMP/fakebin/ollama" "$RUNNER_TEMP/fakebin/df"
 
       - name: 'Speed gate: dense models over the chip cap are skipped, MoE is exempt'
         run: |
@@ -390,6 +442,90 @@ jobs:
           echo "$output" | grep -q 'no dense-speed cap applied' \
             || { echo "FAIL: expected no dense-speed cap on a non-Apple host"; echo "$output"; exit 1; }
           echo "Memory-only sizing confirmed"
+
+      # ---------------------------------------------------------------------
+      # --sync-models (v3.5.0), against the stub ollama. Picks on a 64 GB
+      # M4 Pro: qwen3.6:35b-a3b (daily, vision), qwen3.8:27b (reasoning),
+      # qwen3.6:35b-a3b-coding (coding), granite4.2:3b (light).
+      # ---------------------------------------------------------------------
+      - name: 'Sync: pulls only chosen picks, removes only models answered yes'
+        run: |
+          . "$RUNNER_TEMP/simulate.sh"
+          label="sync happy path"
+          export FAKE_OLLAMA_MODELS="llama3.3:70b qwen2.5:32b-instruct nomic-embed-text qwen3.8:27b"
+          export FAKE_EMBED="nomic-embed-text:latest"
+          # pulls: qwen3.6 y, coding n, granite y | removals: llama3.3 y, qwen2.5 n, nomic n
+          sync 'Apple M4 Pro' 12 64 'y n y y n n'
+          [ "$SYNC_RC" -eq 0 ] || { echo "FAIL: exit $SYNC_RC"; exit 1; }
+          called 'pull qwen3.6:35b-a3b'; called 'pull granite4.2:3b'
+          not_called 'pull qwen3.6:35b-a3b-coding'; not_called 'pull qwen3.8:27b'
+          called 'rm llama3.3:70b'; not_called 'rm qwen2.5:32b-instruct'; not_called 'rm nomic-embed-text:latest'
+          not_called 'rm qwen3.8:27b'
+          expect 'Embedding model'
+          # every pull must be logged before the first rm
+          last_pull=$(grep -n '^pull ' "$RUNNER_TEMP/ollama.log" | tail -1 | cut -d: -f1)
+          first_rm=$(grep -n '^rm ' "$RUNNER_TEMP/ollama.log" | head -1 | cut -d: -f1)
+          [ "$last_pull" -lt "$first_rm" ] || { echo "FAIL: a removal ran before the pulls finished"; exit 1; }
+          echo "ok   pulls all precede removals"
+
+      - name: 'Sync: a failed pull prevents every removal'
+        run: |
+          . "$RUNNER_TEMP/simulate.sh"
+          label="sync pull failure"
+          export FAKE_OLLAMA_MODELS="llama3.3:70b"
+          export FAKE_PULL_FAIL="qwen3.6:35b-a3b"
+          sync 'Apple M4 Pro' 12 64 'y y y y y y y y'
+          [ "$SYNC_RC" -eq 1 ] || { echo "FAIL: expected exit 1, got $SYNC_RC"; exit 1; }
+          called 'pull qwen3.6:35b-a3b'; not_called 'rm llama3.3:70b'
+          expect 'no models were removed'
+
+      - name: 'Sync: Ollama not running exits 1 and changes nothing'
+        run: |
+          . "$RUNNER_TEMP/simulate.sh"
+          label="sync daemon down"
+          export FAKE_OLLAMA_DOWN=1
+          sync 'Apple M4 Pro' 12 64 'y y y y'
+          [ "$SYNC_RC" -eq 1 ] || { echo "FAIL: expected exit 1, got $SYNC_RC"; exit 1; }
+          expect 'Nothing was changed'
+          ! grep -qE '^(pull|rm) ' "$RUNNER_TEMP/ollama.log" || { echo "FAIL: pull or rm was called"; exit 1; }
+          echo "ok   no pull or rm"
+
+      - name: 'Sync: stale catalogue is replaced only on yes, with a backup'
+        run: |
+          . "$RUNNER_TEMP/simulate.sh"
+          old="$RUNNER_TEMP/old.catalog"
+          printf '%s\n' '# Last-Updated: 2026-08-09' '8|qwen2.5:7b-instruct|5|dense|daily|yes|old' > "$old"
+          export FAKE_OLLAMA_MODELS="qwen2.5:7b-instruct"
+          label="stale, answer no"; sync 'Apple M4 Pro' 12 64 'n n' "$old"
+          expect 'dated 2026-08-09'
+          grep -q '^# Last-Updated: 2026-08-09' "$SYNC_HOME/.config/llmstack/models.catalog" \
+            || { echo "FAIL: catalogue changed despite no"; exit 1; }
+          echo "ok   [$label] catalogue unchanged"
+          # yes to refresh, then decline all pulls and the removal
+          label="stale, answer yes"; sync 'Apple M4 Pro' 12 64 'y n n n n' "$old"
+          grep -q '^# Last-Updated: 2026-09-30' "$SYNC_HOME/.config/llmstack/models.catalog" \
+            || { echo "FAIL: catalogue not replaced"; exit 1; }
+          ls "$SYNC_HOME"/.config/llmstack/models.catalog.backup-* >/dev/null \
+            || { echo "FAIL: no backup written"; exit 1; }
+          expect 'qwen3.6:35b-a3b'
+          echo "ok   [$label] replaced, backup kept, new picks shown"
+
+      - name: 'Sync: disk shortfall stops before any pull'
+        run: |
+          . "$RUNNER_TEMP/simulate.sh"
+          label="sync disk short"
+          export FAKE_OLLAMA_MODELS="llama3.3:70b" FAKE_DISK_GB=20
+          sync 'Apple M4 Pro' 12 64 'y y y y y'
+          [ "$SYNC_RC" -eq 1 ] || { echo "FAIL: expected exit 1, got $SYNC_RC"; exit 1; }
+          expect 'Nothing was changed'
+          ! grep -qE '^(pull|rm) ' "$RUNNER_TEMP/ollama.log" || { echo "FAIL: pull or rm was called"; exit 1; }
+          echo "ok   no pull or rm"
+
+      - name: '--recommend stays read-only and points to --sync-models'
+        run: |
+          . "$RUNNER_TEMP/simulate.sh"
+          label="recommend pointer"; out="$(simulate 'Apple M4 Pro' 12 64 '')"
+          expect '--sync-models'
 
       # ---------------------------------------------------------------------
       # Live tag guard (replaces the old static "fictional tag" blocklist,
