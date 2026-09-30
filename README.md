@@ -97,8 +97,8 @@ Finally, turn on web search: **Admin → Settings → Web Search**, set *Enable*
 | `--sync-models` | Pull the recommended models you choose, then offer each other installed model for removal. Interactive; every prompt defaults to no. See [Syncing models](#syncing-models). |
 | `--uninstall` | Guided teardown, confirming every step. |
 | `--check-models` | Validate every catalogue tag against the Ollama registry and fix the VERIFIED column in place. |
-| `--refresh-catalog` | Write `models.catalog.proposed` — revalidated tags plus newer variants in your families. Never touches the live file. Add `--discover` to also scan for new families. |
-| `--refresh-catalog-apply` | As above, then replace the live catalogue after a backup and confirmation. Accepts `--discover`. |
+| `--refresh-catalog` | Write `models.catalog.proposed`: tags revalidated in place, plus newer variants in your families as `# REVIEW:` suggestions. Never touches the live file. Add `--discover` to also scan for new families. |
+| `--refresh-catalog-apply` | As above, then replace the live catalogue after a backup and confirmation, setting `Last-Updated` to today. Accepts `--discover`. |
 | `--version` | Print the script version and exit. |
 | `--help` | Full documentation. |
 
@@ -203,13 +203,21 @@ MIN_RAM_GB | TAG | SIZE_GB | ARCH | ROLE | VERIFIED | NOTES
 32|qwen3.6:35b-a3b|23|moe|daily|yes|Qwen 3.6 35B MoE, 3B active. Fast on every chip tier.
 ```
 
-### The date header
+### The header lines
 
 ```
 # Last-Updated: 2026-09-30
+# Catalogue-Generation: 3.4.0
 ```
 
-The script parses this and grades the file's age:
+They answer two different questions.
+
+- **`Last-Updated`** — when a person last reviewed the file. It changes only when you edit it, or when you confirm `--refresh-catalog-apply`. The script grades the file's age from it.
+- **`Catalogue-Generation`** — which built-in catalogue the file descends from: the script version in which the built-in rows last changed. `--sync-models` offers to replace your file when this marker is missing or older than the script's. If you maintain your own catalogue, keep the marker current and you won't be asked.
+
+Before v3.5.1 there was only the date, and the refresh tooling stamped it with today's date on every proposal. A catalogue could therefore look brand new while holding a generation-old model list.
+
+The age grading from `Last-Updated`:
 
 | Age | Reported as |
 |---|---|
@@ -264,8 +272,8 @@ all built on the Ollama registry manifest endpoint (a live tag returns HTTP
 | Command | What it does |
 |---|---|
 | `--check-models` | Probes every catalogue tag. Corrects the VERIFIED column in place (`200` → `yes`, `404` → `no`) after backing up the file. Flags dead tags. |
-| `--refresh-catalog` | Writes `models.catalog.proposed` alongside the live file — never touching the live one. Re-validates every tag, comments out dead ones, and adds newer size variants found within your existing families. Review it, then `mv` it into place if you approve. |
-| `--refresh-catalog-apply` | Same, but replaces the live catalogue with the proposal after a backup and a confirmation prompt. |
+| `--refresh-catalog` | Writes `models.catalog.proposed` alongside the live file — never touching the live one. Walks the file in order, re-validating each row where it stands and commenting out dead ones in place, then suggests newer size variants within your existing families as `# REVIEW:` comments. Review it, then `mv` it into place if you approve. |
+| `--refresh-catalog-apply` | Same, but replaces the live catalogue with the proposal after a backup and a confirmation prompt, and sets `Last-Updated` to today — confirming the diff is your review. |
 
 `--update` runs `--check-models` automatically, so a routine update also
 corrects the VERIFIED column and warns you about retired tags.
@@ -284,11 +292,27 @@ safe to run in CI with no network access. Nothing ever reaches the catalogue
 without a manifest confirmation, so a broken scrape or a bad guess can't
 introduce a tag that doesn't exist.
 
-Every candidate — whether a variant probed within a family or a family found
-by discovery — is confirmed against the registry before it appears in the
-proposal, and lands with its judgment columns (`MIN_RAM`, `ROLE`, `SIZE`,
-`NOTES`) marked `REVIEW` for you to set. The tool finds and confirms; you
-still decide what belongs and how it's classified.
+Every candidate, whether a variant probed within a family or a family found
+by discovery, is confirmed against the registry before it appears in the
+proposal. It arrives as a comment, with every judgment column marked
+`REVIEW`:
+
+```
+# REVIEW: REVIEW|qwen3.6:27b|REVIEW|REVIEW|REVIEW|yes|Confirmed in the registry. Set MIN_RAM, SIZE, ARCH, ROLE and NOTES.
+```
+
+To adopt one, fill in the fields and delete the leading `# REVIEW: `.
+Until you do, it can never be recommended. A suggestion already in your file
+is not repeated on the next refresh. Separately, the script never picks any
+live row whose `MIN_RAM` or `SIZE` isn't a number, so a half-edited row is
+ignored too. The tool finds and confirms; you decide what belongs and how
+it's classified.
+
+Before v3.5.1 the refresh tooling moved every comment to the top of the
+file, which cut section headings off from their rows. It also added
+suggestions as live rows with their judgment fields unset. If your
+catalogue has been through a few refreshes, `--sync-models` will offer to
+replace it with a clean copy. Your old file is kept as a backup.
 
 ---
 
@@ -397,7 +421,7 @@ The block is delimited by start and end markers. Re-running the installer **repl
 
 `--recommend` tells you what suits the machine; `--sync-models` makes the installed models match it. With Ollama running, it:
 
-1. **Offers to refresh an out-of-date catalogue.** If yours is older than the one built into the script, it explains why and offers to back it up and replace it.
+1. **Offers to replace an out-of-date catalogue.** If your catalogue's `Catalogue-Generation` marker is missing or older than the script's, it explains why and offers to back it up and replace it. The date line plays no part in this.
 2. **Shows the current picks**, each with its roles, size, and whether it's already installed.
 3. **Asks which missing picks to pull**, once per model. A model serving several roles is asked about once.
 4. **Checks free disk** against the chosen downloads plus 10 GB of headroom, and stops with nothing changed if it's short.
@@ -764,6 +788,20 @@ A few choices worth explaining, since they're the ones people tend to want to ch
 ---
 
 ## Changelog
+
+### v3.5.1
+
+- **Fixed: `--sync-models` could miss an out-of-date catalogue.** It judged age by `Last-Updated`, but the refresh tooling stamped that date on every proposal, so a catalogue holding an old model list could look current. Catalogues now carry a `Catalogue-Generation` marker, and sync decides from that. `--recommend` also notes when your catalogue predates the built-in one.
+- **Fixed: refresh proposals degraded the catalogue.**
+  - Every comment was moved to the top, so section headings were cut off from their rows.
+  - Suggestions were added as live rows with their judgment fields unset.
+  - `Last-Updated` was set without any review.
+
+  Proposals now keep the file in order, comment out dead rows in place, and add suggestions only as `# REVIEW:` comments, without repeating one already in the file. They leave the date alone; `--refresh-catalog-apply` sets it only when you confirm.
+- **Fixed: silent exit on a catalogue without a `Last-Updated` line** (present since v3.3.0). Under `set -o pipefail`, a lookup that found nothing aborted the script with no message; `--recommend` exited 1 with no output. The catalogue lookups now treat "not found" as a normal answer.
+- **Fixed: `--refresh-catalog-apply` offline** could offer to apply a leftover proposal from an earlier run. It now applies only a proposal built in the same run.
+- **Hardened:** a live row whose `MIN_RAM` or `SIZE` is not a number is never selected.
+- **CI:** a stub `curl` impersonates the registry to test proposal structure, de-duplication and date handling. The sync tests now cover a catalogue dated today but with no marker, an older marker, and a current marker. Both new checks were mutation-tested.
 
 ### v3.5.0
 
