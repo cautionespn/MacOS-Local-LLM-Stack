@@ -380,6 +380,8 @@ jobs:
           expect 'daily: +gemma4:26b-a4b-it-qat$'; expect 'coding: +qwen3.5:9b$'
           label="M1 8GB"; out="$(simulate 'Apple M1' 8 8 '')"
           expect 'daily: +qwen3.5:4b$'; expect 'light: +granite4.2:3b$'
+          label="7 GB VM (GitHub macOS runner size)"; out="$(simulate 'Apple M1 (Virtual)' 3 7 '')"
+          expect 'light: +granite4.2:3b$'
 
       - name: 'Non-Apple host: sized by memory alone, no dense-speed cap'
         run: |
