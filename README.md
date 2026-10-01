@@ -123,6 +123,8 @@ Every mode is safe to re-run. The installer checks state before acting and never
                        Fail-soft — a failed scrape still yields a proposal.
 ```
 
+**Settings carry over between runs.** The installer reads `~/.config/llmstack/config` first, then applies the options you pass, so a plain re-run keeps your SearXNG URL, ports and bind address. `--searxng-port` switches a remote install back to local SearXNG; `--searxng-url` wins if you pass both. The `DETECTED SYSTEM` summary shows the web-search and Open WebUI settings the run will use.
+
 Ports are validated as integers in the range 1–65535; an invalid value is rejected before anything is installed. The script also checks for port conflicts before installing and warns if the target port is already in use, naming the process that holds it.
 
 Examples:
@@ -344,6 +346,8 @@ Run SearXNG on a Linux host, where Docker is a real systemd service that starts 
 
 This mode installs **no container runtime at all** on the Mac — no Colima, no docker CLI. The whole stack then survives reboots cleanly.
 
+The URL is saved, so later runs (including a plain `./llmstack-macos.sh`) keep using it. To go back to a local SearXNG, re-run with `--searxng-port 8888`. (Before v3.6.2 a plain re-run silently switched back to local.)
+
 A minimal Compose definition for the Linux side:
 
 ```yaml
@@ -510,9 +514,9 @@ Colima removal is its own prompt, since another project on the machine may want 
 | Open WebUI | `0.0.0.0:8080` | the LAN |
 | SearXNG | `127.0.0.1:8888` | this machine only |
 
-Open WebUI binds to all interfaces deliberately so phones and laptops can use it. **On a machine that joins untrusted networks, change this** — `--webui-port` doesn't alter the bind address, so edit the plist's `--host` argument to `127.0.0.1` and reload the daemon.
+Open WebUI binds to all interfaces deliberately so phones and laptops can use it. **On a machine that joins untrusted networks, change this:** `--webui-port` doesn't alter the bind address, so set `WEBUI_BIND="127.0.0.1"` in `~/.config/llmstack/config` and re-run the installer, which rewrites the plist and reloads the daemon.
 
-The bind address is persisted in `~/.config/llmstack/config` as `WEBUI_BIND`, so the shell functions pick it up correctly if you change it.
+The shell functions read `WEBUI_BIND` from the same file, so they follow the change.
 
 ---
 
@@ -768,7 +772,7 @@ To write to `/Library/LaunchDaemons/`. That's the only way to get services start
 
 **Is it safe to re-run?**
 
-Yes. Every step checks state first. Data, models, the secret key, and the catalogue are all preserved.
+Yes. Every step checks state first. Data, models, the secret key, the catalogue and your settings (`~/.config/llmstack/config`) are all preserved.
 
 ---
 
@@ -795,6 +799,15 @@ A few choices worth explaining, since they're the ones people tend to want to ch
 ---
 
 ## Changelog
+
+### v3.6.2
+
+- **Re-runs keep your settings.** The installer now reads `~/.config/llmstack/config` before applying options, as the Ubuntu and Windows installers do. Previously a plain re-run reset everything to defaults and rewrote the config, so an install made with `--searxng-url` silently went back to local SearXNG, and a changed port or `WEBUI_BIND` was lost.
+  - `--searxng-port` now also switches a remote install back to local SearXNG; `--searxng-url` wins if both are given.
+  - The `DETECTED SYSTEM` summary shows the web-search and Open WebUI settings the run will use.
+  - Ports read from the config are validated too, so a hand-edited bad port stops the install with a message naming the file.
+- **CI:** seven new checks run the install's plan with a simulated Mac, stopping before anything is installed. They confirm that saved settings survive, options override them, and a bad port in the config is refused. They fail against the v3.6.1 logic. All workflows use `actions/checkout@v5`, as Node 20 is deprecated on runners.
+- **`PROMPT.md`** is now the full rebuild specification, exported from the maintainer's spec set. It corrects the old §10.6, which said bootstrap was verified with `launchctl print`; the script uses readiness polls on the services' own endpoints.
 
 ### v3.6.1
 
