@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# llmstack-macos.sh  v3.6.1
+# llmstack-macos.sh  v3.6.2
 #
 # A self-contained, private LLM stack for macOS on Apple Silicon.
 #
@@ -23,7 +23,7 @@ set -euo pipefail
 # Constants
 # ---------------------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="3.6.1"
+SCRIPT_VERSION="3.6.2"
 CATALOG_DATE="2026-09-30"
 # The script version in which the built-in catalogue rows last changed.
 # Written into every built-in catalogue; --sync-models offers to replace a
@@ -931,6 +931,23 @@ load_config() {
   fi
 }
 
+# Install settings: the saved config first, then options from this command
+# line. Before 3.6.2 the install never read the config, so a plain re-run
+# reset everything to defaults (a --searxng-url install fell back to local).
+resolve_settings() {
+  load_config
+  [ -z "$CLI_WEBUI_PORT" ] || WEBUI_PORT="$CLI_WEBUI_PORT"
+  if [ -n "$CLI_SEARXNG_PORT" ]; then
+    SEARXNG_HOST_PORT="$CLI_SEARXNG_PORT"
+    SEARXNG_MODE="local"
+    SEARXNG_URL="http://127.0.0.1:${SEARXNG_HOST_PORT}"
+  fi
+  if [ -n "$CLI_SEARXNG_URL" ]; then
+    SEARXNG_URL="$CLI_SEARXNG_URL"
+    SEARXNG_MODE="remote"
+  fi
+}
+
 write_config() {
   mkdir -p "$CONFIG_DIR"
   cat > "$CONFIG_FILE" <<CONFIG_EOF
@@ -1011,10 +1028,12 @@ OPTIONS
     --searxng-url URL
                     Use an existing SearXNG instance instead of installing
                     one locally. Skips Colima and Docker entirely.
+                    Saved, so later runs keep using it.
                     Example: --searxng-url http://192.168.1.23:8899
     --searxng-port PORT
                     Host port for the local SearXNG container.
-                    Default ${SEARXNG_HOST_PORT}.
+                    Default ${SEARXNG_HOST_PORT}. Also switches a remote
+                    install back to local SearXNG.
     --webui-port PORT
                     Port for Open WebUI. Default ${WEBUI_PORT}.
     --model TAG     Install this model instead of the catalogue's
@@ -1035,7 +1054,8 @@ COMPONENTS
     SearXNG             private metasearch, local mode only
     Draw Things         image and video generation, from the Mac App Store
 LAYOUT
-    ~/.config/llmstack/config             installer settings
+    ~/.config/llmstack/config             installer settings; read by every
+                                          install, then overridden by options
     ~/.config/llmstack/models.catalog     model catalogue, yours to edit
     ~/.config/llmstack/openwebui-secret   persisted secret key, mode 0600
     ~/openwebui-venv                      Open WebUI virtualenv
@@ -1754,6 +1774,7 @@ start_searxng_container() {
 # ARGUMENT PARSING
 # ===========================================================================
 MODE="install"
+CLI_SEARXNG_URL="" CLI_SEARXNG_PORT="" CLI_WEBUI_PORT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --help|-h)      show_help ;;
@@ -1770,19 +1791,17 @@ while [ $# -gt 0 ]; do
     --discover)     DISCOVER="yes" ;;
     --searxng-url)
       [ $# -ge 2 ] || error "--searxng-url needs a URL"
-      SEARXNG_URL="${2%/}"
-      SEARXNG_MODE="remote"
+      CLI_SEARXNG_URL="${2%/}"
       shift ;;
     --searxng-port)
       [ $# -ge 2 ] || error "--searxng-port needs a port number"
       validate_port "$2"
-      SEARXNG_HOST_PORT="$2"
-      SEARXNG_URL="http://127.0.0.1:${SEARXNG_HOST_PORT}"
+      CLI_SEARXNG_PORT="$2"
       shift ;;
     --webui-port)
       [ $# -ge 2 ] || error "--webui-port needs a port number"
       validate_port "$2"
-      WEBUI_PORT="$2"
+      CLI_WEBUI_PORT="$2"
       shift ;;
     --model)
       [ $# -ge 2 ] || error "--model needs a tag"
@@ -1821,6 +1840,7 @@ if ! xcode-select -p >/dev/null 2>&1; then
   echo "    wait for it to finish, then re-run this script."
 fi
 
+resolve_settings
 detect_system
 ensure_catalog
 
@@ -1836,6 +1856,12 @@ printf '  Usable for models: ~%s GB\n' "$SYS_USABLE_GB"
 printf '  Free disk:         %s GB\n' "$SYS_DISK_FREE_GB"
 print_bandwidth_lines
 printf '  %s\n' "$(bandwidth_note)"
+if [ "$SEARXNG_MODE" = "remote" ]; then
+  printf '  Web search:        remote SearXNG at %s\n' "$SEARXNG_URL"
+else
+  printf '  Web search:        local SearXNG (Colima) on 127.0.0.1:%s\n' "$SEARXNG_HOST_PORT"
+fi
+printf '  Open WebUI:        port %s, bound to %s\n' "$WEBUI_PORT" "$WEBUI_BIND"
 cat <<'DETECTED_FTR'
 ===========================================================================
 DETECTED_FTR
@@ -1898,6 +1924,13 @@ else
     fi
   fi
   report_catalog_age
+fi
+
+# Test hook: stop after the plan, before anything is installed. CI uses it
+# to check settings precedence. Not documented in --help.
+if [ "${LLMSTACK_PLAN_ONLY:-}" = "1" ]; then
+  printf '\nPlan only (LLMSTACK_PLAN_ONLY=1); nothing was installed.\n'
+  exit 0
 fi
 
 log "Requesting sudo up front (needed for system LaunchDaemons)"

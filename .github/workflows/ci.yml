@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install shellcheck
         run: |
@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Make executable
         run: chmod +x llmstack-macos.sh
@@ -404,6 +404,63 @@ jobs:
           chmod +x "$RUNNER_TEMP/fakecurl/curl"
           chmod +x "$RUNNER_TEMP/fakebin/sysctl" "$RUNNER_TEMP/fakebin/ioreg" \
             "$RUNNER_TEMP/fakebin/ollama" "$RUNNER_TEMP/fakebin/df"
+
+      # The install's plan, stopped by LLMSTACK_PLAN_ONLY before sudo, with
+      # uname reporting Darwin/arm64 so preflight passes on Linux. Before
+      # 3.6.2 the install ignored the saved config (backlog 4a).
+      - name: 'Settings precedence: the install loads the config, then options'
+        run: |
+          . "$RUNNER_TEMP/simulate.sh"
+          mkdir -p "$RUNNER_TEMP/darwinbin"
+          cat > "$RUNNER_TEMP/darwinbin/uname" <<'EOF'
+          #!/bin/bash
+          case "$1" in -s) echo Darwin ;; -m) echo arm64 ;; *) exec /usr/bin/uname "$@" ;; esac
+          EOF
+          chmod +x "$RUNNER_TEMP/darwinbin/uname"
+          # usage: plan CONFIG_TEXT [ARGS...]; CONFIG_TEXT empty means no config.
+          # Not called inside $(...): out and PLAN_RC must reach the step.
+          plan() {
+            local h cfg="$1"; h="$(mktemp -d)"; shift
+            if [ -n "$cfg" ]; then mkdir -p "$h/.config/llmstack"; printf '%s\n' "$cfg" > "$h/.config/llmstack/config"; fi
+            PLAN_RC=0
+            HOME="$h" PATH="$RUNNER_TEMP/darwinbin:$RUNNER_TEMP/fakebin:$PATH" LLMSTACK_PLAN_ONLY=1 \
+              FAKE_CHIP='Apple M4 Pro' FAKE_NCPU=12 FAKE_RAM_GB=64 FAKE_GPU='' FAKE_DISK_GB=500 \
+              ./llmstack-macos.sh "$@" > "$RUNNER_TEMP/plan.out" 2>&1 < /dev/null || PLAN_RC=$?
+            out="$(cat "$RUNNER_TEMP/plan.out")"
+            [ "$PLAN_RC" -eq 0 ] || { echo "::error::[$label] exited $PLAN_RC"; echo "$out"; exit 1; }
+            expect 'Plan only \(LLMSTACK_PLAN_ONLY=1\); nothing was installed\.'
+            # Nothing installed and the saved config untouched.
+            for f in .zshrc openwebui-venv Library; do
+              if [ -e "$h/$f" ]; then echo "::error::[$label] plan-only run created ~/$f"; exit 1; fi
+            done
+            if [ -n "$cfg" ] && [ "$(cat "$h/.config/llmstack/config")" != "$cfg" ]; then
+              echo "::error::[$label] plan-only run changed the config"; exit 1
+            fi
+            if [ -z "$cfg" ] && [ -e "$h/.config/llmstack/config" ]; then
+              echo "::error::[$label] plan-only run wrote a config"; exit 1
+            fi
+            rm -rf "$h"
+            echo "ok   [$label] exit 0, nothing installed"
+          }
+          remote='SEARXNG_MODE="remote"
+          SEARXNG_URL="http://10.0.0.5:8899"
+          SEARXNG_HOST_PORT="8888"
+          WEBUI_PORT="3000"
+          WEBUI_BIND="127.0.0.1"'
+          label="no config: defaults"; plan ''
+          expect 'Web search: +local SearXNG \(Colima\) on 127\.0\.0\.1:8888$'
+          expect 'Open WebUI: +port 8080, bound to 0\.0\.0\.0$'
+          label="saved remote config is kept on a plain re-run"; plan "$remote"
+          expect 'Web search: +remote SearXNG at http://10\.0\.0\.5:8899$'
+          expect 'Open WebUI: +port 3000, bound to 127\.0\.0\.1$'
+          label="--searxng-port returns a remote install to local"; plan "$remote" --searxng-port 9999
+          expect 'Web search: +local SearXNG \(Colima\) on 127\.0\.0\.1:9999$'
+          label="--searxng-url overrides the saved URL"; plan "$remote" --searxng-url http://b:1/
+          expect 'Web search: +remote SearXNG at http://b:1$'
+          label="--searxng-url wins over --searxng-port"; plan '' --searxng-port 9999 --searxng-url http://b:1
+          expect 'Web search: +remote SearXNG at http://b:1$'
+          label="--webui-port overrides the saved port"; plan "$remote" --webui-port 3100
+          expect 'Open WebUI: +port 3100, bound to 127\.0\.0\.1$'
 
       - name: 'Speed gate: dense models over the chip cap are skipped, MoE is exempt'
         run: |
@@ -803,7 +860,7 @@ jobs:
       github.event_name == 'workflow_dispatch'
       || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Make executable
         run: chmod +x llmstack-macos.sh
