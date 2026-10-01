@@ -118,10 +118,11 @@ confirm() {
 # ---------------------------------------------------------------------------
 # Input validation
 # ---------------------------------------------------------------------------
+# validate_port PORT [WHERE]: WHERE names a source other than the command line.
 validate_port() {
-  local p="$1"
+  local p="$1" where="${2:-}"
   if ! [[ "$p" =~ ^[0-9]+$ ]] || [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
-    error "Invalid port: '$p' (must be 1–65535)"
+    error "Invalid port: '$p' (must be 1–65535)${where:+ ($where)}"
   fi
 }
 
@@ -945,6 +946,11 @@ resolve_settings() {
   if [ -n "$CLI_SEARXNG_URL" ]; then
     SEARXNG_URL="$CLI_SEARXNG_URL"
     SEARXNG_MODE="remote"
+  fi
+  # Options were checked when parsed; the config may have been hand-edited.
+  validate_port "$WEBUI_PORT" "WEBUI_PORT in $CONFIG_FILE"
+  if [ "$SEARXNG_MODE" = "local" ]; then
+    validate_port "$SEARXNG_HOST_PORT" "SEARXNG_HOST_PORT in $CONFIG_FILE"
   fi
 }
 

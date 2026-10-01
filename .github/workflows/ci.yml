@@ -461,6 +461,16 @@ jobs:
           expect 'Web search: +remote SearXNG at http://b:1$'
           label="--webui-port overrides the saved port"; plan "$remote" --webui-port 3100
           expect 'Open WebUI: +port 3100, bound to 127\.0\.0\.1$'
+          label="an invalid port in the config stops the install"
+          h="$(mktemp -d)"; mkdir -p "$h/.config/llmstack"; printf 'WEBUI_PORT="80800"\n' > "$h/.config/llmstack/config"
+          rc=0
+          out="$(HOME="$h" PATH="$RUNNER_TEMP/darwinbin:$RUNNER_TEMP/fakebin:$PATH" LLMSTACK_PLAN_ONLY=1 \
+            FAKE_CHIP='Apple M4 Pro' FAKE_NCPU=12 FAKE_RAM_GB=64 FAKE_GPU='' FAKE_DISK_GB=500 \
+            ./llmstack-macos.sh 2>&1 < /dev/null)" || rc=$?
+          [ "$rc" -eq 1 ] || { echo "::error::[$label] exited $rc, expected 1"; echo "$out"; exit 1; }
+          expect "Invalid port: '80800' .*WEBUI_PORT in .*config"
+          reject 'Plan only'
+          rm -rf "$h"
 
       - name: 'Speed gate: dense models over the chip cap are skipped, MoE is exempt'
         run: |

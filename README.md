@@ -805,7 +805,8 @@ A few choices worth explaining, since they're the ones people tend to want to ch
 - **Re-runs keep your settings.** The installer now reads `~/.config/llmstack/config` before applying options, as the Ubuntu and Windows installers do. Previously a plain re-run reset everything to defaults and rewrote the config, so an install made with `--searxng-url` silently went back to local SearXNG, and a changed port or `WEBUI_BIND` was lost.
   - `--searxng-port` now also switches a remote install back to local SearXNG; `--searxng-url` wins if both are given.
   - The `DETECTED SYSTEM` summary shows the web-search and Open WebUI settings the run will use.
-- **CI:** six new checks run the install's plan with a simulated Mac, stopping before anything is installed, and confirm that saved settings survive and options override them. They fail against the v3.6.1 logic. All workflows use `actions/checkout@v5`, as Node 20 is deprecated on runners.
+  - Ports read from the config are validated too, so a hand-edited bad port stops the install with a message naming the file.
+- **CI:** seven new checks run the install's plan with a simulated Mac, stopping before anything is installed. They confirm that saved settings survive, options override them, and a bad port in the config is refused. They fail against the v3.6.1 logic. All workflows use `actions/checkout@v5`, as Node 20 is deprecated on runners.
 - **`PROMPT.md`** is now the full rebuild specification, exported from the maintainer's spec set. It corrects the old §10.6, which said bootstrap was verified with `launchctl print`; the script uses readiness polls on the services' own endpoints.
 
 ### v3.6.1

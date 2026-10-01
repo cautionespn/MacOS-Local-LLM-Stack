@@ -138,6 +138,7 @@ Install Homebrew, `python@3.11` and a container runtime only as needed. Prefer p
   1. `--webui-port` sets `WEBUI_PORT`.
   2. `--searxng-port` sets `SEARXNG_HOST_PORT`, sets `SEARXNG_MODE=local` and `SEARXNG_URL=http://127.0.0.1:<port>`. This is how a remote install returns to local search.
   3. `--searxng-url` sets `SEARXNG_URL` (trailing `/` removed) and `SEARXNG_MODE=remote`, so it wins over `--searxng-port`.
+  4. Validate `WEBUI_PORT`, and `SEARXNG_HOST_PORT` in local mode, wherever they came from. A port from the config that is not 1–65535 stops with `Invalid port ... (WEBUI_PORT in ~/.config/llmstack/config)`; options were already checked when parsed.
   The install calls `resolve_settings`, so a plain re-run keeps a remote SearXNG, a non-default port and `WEBUI_BIND`. Status, update and uninstall only `load_config`: they act on what is installed, and these options do not apply to them.
 - **Ports.** Validate every port as an integer from 1 to 65535 before installing anything; reject anything else with a clear error. Before installing, check whether `--webui-port`, and `--searxng-port` in local mode, are in use. Warn with the holder's process name and PID from `lsof`. Don't abort.
 
@@ -562,6 +563,7 @@ The README must cover:
   - that config plus `--searxng-port 9999`: local on 9999;
   - that config plus `--searxng-url http://b:1/`: remote `http://b:1`;
   - a config with `WEBUI_PORT="3000"`: port 3000; adding `--webui-port 3100`: port 3100;
+  - a config with `WEBUI_PORT="80800"`: exits 1 naming the config, and installs nothing;
   - each run exits 0 and leaves no `com.local.*` plist, venv or `.zshrc` block behind.
 
 **macOS job** (Apple Silicon runner):
