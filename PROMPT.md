@@ -22,7 +22,7 @@
 | | |
 |---|---|
 | Repository | `cautionespn/MacOS-Local-LLM-Stack` (public, GPL v3) |
-| Current version | 3.6.2 (2026-10-01; release `3.6.2` to be published by Chris). Previous: 3.6.1, tag `3.6.1` |
+| Current version | 3.6.2 (2026-10-01), tag `3.6.2` |
 | Catalogue generation | 3.4.0 |
 | Verified on | deepthought, an M4 Pro with 64 GB (real install, sync, outdated-build check); CI on Ubuntu with simulated hardware; a conditional macOS-runner job |
 
