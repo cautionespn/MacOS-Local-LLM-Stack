@@ -800,6 +800,11 @@ A few choices worth explaining, since they're the ones people tend to want to ch
 
 ## Changelog
 
+### v3.6.3
+
+- **A failed `--sync-models` pull now says why.** The script checks each failed tag against the Ollama registry. If the registry has the tag, it reports that the download itself was cut off and suggests a VPN, proxy or security software that may be resetting long downloads; downloaded parts are kept, so re-running resumes them. If the tag is missing it points at the Ollama library, and if the registry does not answer it says so. Previously every failure said "Check the tag", even when the tag was fine and a corporate security tool was dropping the connection.
+- **`PROMPT.md`** updated from the maintainer's spec.
+
 ### v3.6.2
 
 - **Re-runs keep your settings.** The installer now reads `~/.config/llmstack/config` before applying options, as the Ubuntu and Windows installers do. Previously a plain re-run reset everything to defaults and rewrote the config, so an install made with `--searxng-url` silently went back to local SearXNG, and a changed port or `WEBUI_BIND` was lost.
