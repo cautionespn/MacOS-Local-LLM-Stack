@@ -578,6 +578,35 @@ jobs:
           called 'pull qwen3.6:35b-a3b'; not_called 'rm llama3.3:70b'
           expect 'no models were removed'
 
+      # 3.6.3: the failure names its cause. The stub registry serves the tags
+      # in FAKE_LIVE, 404s the rest and refuses connections with FAKE_REG_DOWN.
+      - name: 'Sync: a failed pull says why (live tag, missing tag, no registry)'
+        run: |
+          . "$RUNNER_TEMP/simulate.sh"
+          export FAKE_OLLAMA_MODELS="llama3.3:70b"
+          export FAKE_PULL_FAIL="qwen3.6:35b-a3b"
+          label="pull failure, live tag"
+          FAKE_LIVE="qwen3.6:35b-a3b" sync 'Apple M4 Pro' 12 64 'y y y y y y y y'
+          [ "$SYNC_RC" -eq 1 ] || { echo "FAIL: expected exit 1, got $SYNC_RC"; exit 1; }
+          not_called 'rm llama3.3:70b'
+          expect 'qwen3.6:35b-a3b +download failed \(the tag is in the registry\)'
+          expect 'VPN,'
+          reject 'Check the tag|tag not found|registry unreachable'
+          label="pull failure, missing tag"
+          sync 'Apple M4 Pro' 12 64 'y y y y y y y y'
+          [ "$SYNC_RC" -eq 1 ] || { echo "FAIL: expected exit 1, got $SYNC_RC"; exit 1; }
+          not_called 'rm llama3.3:70b'
+          expect 'qwen3.6:35b-a3b +tag not found in the registry'
+          expect 'Check the tag at https://ollama.com/library'
+          reject 'download failed|VPN,|registry unreachable'
+          label="pull failure, registry down"
+          FAKE_REG_DOWN=1 sync 'Apple M4 Pro' 12 64 'y y y y y y y y'
+          [ "$SYNC_RC" -eq 1 ] || { echo "FAIL: expected exit 1, got $SYNC_RC"; exit 1; }
+          not_called 'rm llama3.3:70b'
+          expect 'qwen3.6:35b-a3b +registry unreachable'
+          expect 'did not answer'
+          reject 'Check the tag|VPN,'
+
       - name: 'Sync: Ollama not running exits 1 and changes nothing'
         run: |
           . "$RUNNER_TEMP/simulate.sh"

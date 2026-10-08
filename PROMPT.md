@@ -12,7 +12,7 @@
 > private meta repository. The rules they share with this spec are copied
 > in below; the rest are the maintainer's working notes.
 
-# 10 — Rebuild spec: MacOS-Local-LLM-Stack (`llmstack-macos.sh` v3.6.2)
+# 10 — Rebuild spec: MacOS-Local-LLM-Stack (`llmstack-macos.sh` v3.6.3)
 
 **Use this prompt to rebuild the repository from an empty folder, or to change it.**
 - Give the whole file to Claude with the instruction: *"Build (or update) the repository described here. Follow it exactly; where it is silent, ask."*
@@ -22,7 +22,7 @@
 | | |
 |---|---|
 | Repository | `cautionespn/MacOS-Local-LLM-Stack` (public, GPL v3) |
-| Current version | 3.6.2 (2026-10-01), tag `3.6.2` |
+| Current version | 3.6.3 (2026-10-08), tag `3.6.3` |
 | Catalogue generation | 3.4.0 |
 | Verified on | deepthought, an M4 Pro with 64 GB (real install, sync, outdated-build check); CI on Ubuntu with simulated hardware; a conditional macOS-runner job |
 
@@ -117,7 +117,7 @@ Install Homebrew, `python@3.11` and a container runtime only as needed. Prefer p
 
 **Mode rules.**
 - **`--help`** is comprehensive: synopsis, every mode and option, components, file layout, ports, startup behaviour *and its limits*, the security note, requirements, post-install steps, exit status and examples.
-- **`--version`** prints `llmstack-macos.sh v3.6.2` and exits 0.
+- **`--version`** prints `llmstack-macos.sh v3.6.3` and exits 0.
 - **`--recommend` and `--status`** are read-only. `--recommend` ends by pointing at `--sync-models`, and notes a catalogue whose generation predates the built-in one.
 - **`--uninstall`** confirms **each artifact separately**:
   - Every prompt defaults to no, and bare Enter skips.
@@ -176,6 +176,18 @@ This mode brings installed models in line with the current picks. **The safety p
    - Warn, and say "Nothing was changed. To free space first, run --sync-models again, decline every pull, and answer yes to the removals you want."
    - Exit 1.
 7. **Pull** everything chosen. On Ctrl-C during a pull, say "Pull interrupted. Nothing was removed. Re-run to resume the download." and stop: bash traps `INT`; PowerShell, where a stop skips `catch` but runs `finally`, prints it from a `finally` guarded by "not done and no ordinary error". If any pull fails, list the failures, say "no models were removed", and exit 1.
+
+   **Say why each pull failed.** Ollama's own error does not tell a missing tag from a dropped connection, so probe each failed tag's manifest once with the registry check (the same endpoint and timeout) and print it with a reason:
+   - 200: `download failed (the tag is in the registry)`
+   - 404: `tag not found in the registry`
+   - anything else: `registry unreachable`
+
+   Then print one hint for each reason that occurred, in that order:
+   - "The registry has the tag, so the download itself was cut off. A VPN, proxy or security software between this machine and the registry may be resetting long downloads. Downloaded parts are kept, so re-running resumes them."
+   - "Check the tag at https://ollama.com/library."
+   - "The registry did not answer. Check this machine's network, then re-run."
+
+   Never suggest checking the tag when the registry served it (MBP5800, 2026-10-05: Zscaler reset every blob download while the manifests loaded, and the old message blamed the tags).
 8. **Remove**, one model at a time:
    - Show the model's name and size.
    - If `ollama show` lists an `embedding` capability, warn that Open WebUI may use it for document search.
@@ -540,7 +552,7 @@ The README must cover:
   - A non-Apple host gets no dense cap.
 - **Sync** (stub `ollama`, stub `df -g`, stub `curl` registry, answers on stdin, a log of calls):
   - happy path, with pulls before removals
-  - a failed pull blocks removals
+  - a failed pull blocks removals, and the failure names its cause: a live tag (download failed, with the VPN/proxy hint and no "check the tag"), a missing tag, or an unreachable registry
   - the daemon down exits 1 with no calls
   - a missing marker is replaced only on yes, with a backup
   - an older generation is offered and the current one is not
@@ -619,6 +631,7 @@ The `--recommend` notes per tier:
 
 | Version | Change |
 |---|---|
+| 3.6.3 | `--sync-models` says why each pull failed: it probes the manifest, so a dropped download on a live tag is no longer blamed on the tag (MBP5800, Zscaler) |
 | 3.6.2 | The install loads the config before applying options, so re-runs keep settings (backlog 4a); `--searxng-port` returns to local mode; plan shows the web-search and Open WebUI settings; `LLMSTACK_PLAN_ONLY` test hook; `actions/checkout@v5`; `PROMPT.md` exported from this spec |
 | 3.6.1 | GPL v3 stated consistently; release-asset workflow; Quick start uses the latest release |
 | 3.6.0 | `--sync-models` detects outdated builds by manifest digest and offers updates |

@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# llmstack-macos.sh  v3.6.2
+# llmstack-macos.sh  v3.6.3
 #
 # A self-contained, private LLM stack for macOS on Apple Silicon.
 #
@@ -23,7 +23,7 @@ set -euo pipefail
 # Constants
 # ---------------------------------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="3.6.2"
+SCRIPT_VERSION="3.6.3"
 CATALOG_DATE="2026-09-30"
 # The script version in which the built-in catalogue rows last changed.
 # Written into every built-in catalogue; --sync-models offers to replace a
@@ -1545,6 +1545,33 @@ _registry_manifest_id() {
   rm -f "$f"
 }
 
+# Why each failed pull failed. Ollama's error does not tell a missing tag
+# from a dropped connection, so probe each manifest once: a tag the registry
+# serves means the download itself was cut off. On MBP5800 (2026-10-05)
+# Zscaler reset every blob download while the manifests loaded, and the old
+# message blamed the tags. $1 is a newline-separated list of tags.
+_explain_pull_failures() {
+  local t why live="" dead="" down=""
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    case "$(registry_probe "$t")" in
+      LIVE) why="download failed (the tag is in the registry)"; live="yes" ;;
+      DEAD) why="tag not found in the registry"; dead="yes" ;;
+      *)    why="registry unreachable"; down="yes" ;;
+    esac
+    printf '      %-30s %s\n' "$t" "$why"
+  done <<< "$1"
+  if [ -n "$live" ]; then
+    echo "    The registry has the tag, so the download itself was cut off. A VPN,"
+    echo "    proxy or security software between this machine and the registry may"
+    echo "    be resetting long downloads. Downloaded parts are kept, so re-running"
+    echo "    resumes them."
+  fi
+  if [ -n "$dead" ]; then echo "    Check the tag at https://ollama.com/library."; fi
+  if [ -n "$down" ]; then echo "    The registry did not answer. Check this machine's network, then re-run."; fi
+  return 0
+}
+
 sync_models() {
   local listing inst="" m gen role line rows="" picks picktags sel="" cands=""
   local tag size arch roles st need sz pulled="" updated="" failed="" removed="" kept=""
@@ -1706,8 +1733,7 @@ EOF_LIST
     trap - INT
     if [ -n "$failed" ]; then
       warn "Some pulls failed, so no models were removed:"
-      printf '%s' "$failed" | sed 's/^/      /'
-      echo "    Check the tag at https://ollama.com/library and your network, then re-run."
+      _explain_pull_failures "$failed"
       exit 1
     fi
   fi
