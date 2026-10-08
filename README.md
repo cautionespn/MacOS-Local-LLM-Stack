@@ -802,7 +802,7 @@ A few choices worth explaining, since they're the ones people tend to want to ch
 
 ### v3.6.3
 
-- **A failed `--sync-models` pull now says why.** The script checks each failed tag against the Ollama registry. If the registry has the tag, it reports that the download itself was cut off and suggests a VPN, proxy or security software that may be resetting long downloads; downloaded parts are kept, so re-running resumes them. If the tag is missing it points at the Ollama library, and if the registry does not answer it says so. Previously every failure said "Check the tag", even when the tag was fine and a corporate security tool was dropping the connection.
+- **A failed `--sync-models` pull now says why.** The script checks each failed tag against the Ollama registry. If the registry has the tag, it reports that the download itself was cut off and suggests a VPN, proxy or security software that may be resetting long downloads; downloaded parts are kept, so re-running resumes them. If the tag is missing it points at the Ollama library, and if the registry does not answer it says so. Previously every failure said "Check the tag", even when the tag was fine and a corporate security tool was dropping the connection. Tested against a stub registry in CI; not yet reproduced end to end on a machine behind an intercepting proxy.
 - **`PROMPT.md`** updated from the maintainer's spec.
 
 ### v3.6.2
