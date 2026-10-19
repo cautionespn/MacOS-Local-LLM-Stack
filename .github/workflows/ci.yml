@@ -326,7 +326,7 @@ jobs:
               cp "$5" "$h/.config/llmstack/models.catalog"
             fi
             # An installed stack has a blobs folder; resuming measures it.
-            mkdir -p "$h/.ollama/models/blobs"
+            [ -n "${SYNC_NO_BLOBS:-}" ] || mkdir -p "$h/.ollama/models/blobs"
             : > "$RUNNER_TEMP/ollama.log"
             # Not called inside $(...): SYNC_RC, SYNC_HOME and out must reach the step.
             SYNC_RC=0
@@ -673,6 +673,18 @@ jobs:
           reject 'Attempt 10 of 10'
           expect 'Giving up on qwen3\.6:35b-a3b for now after 10 attempts\.'
           not_called 'rm llama3.3:70b'
+          label="no blobs folder: progress unknown, ten attempts"
+          SYNC_NO_BLOBS=1 FAKE_PULL_SCRIPT="qwen3.6:35b-a3b=Z" sync 'Apple M4 Pro' 12 64 'y n n n y'
+          [ "$SYNC_RC" -eq 1 ] || { echo "FAIL [$label]: expected exit 1, got $SYNC_RC"; exit 1; }
+          npulls qwen3.6:35b-a3b 10
+          expect "Attempt 1 of 10 was cut off \\(saved progress can't be read here\\)"
+          expect 'Giving up on qwen3\.6:35b-a3b for now after 10 attempts\.'
+          label="progress turns unreadable late: stops at once with the real count"
+          FAKE_PULL_SCRIPT="qwen3.6:35b-a3b=PPPPPPPPPPG" sync 'Apple M4 Pro' 12 64 'y n n n y'
+          [ "$SYNC_RC" -eq 1 ] || { echo "FAIL [$label]: expected exit 1, got $SYNC_RC"; exit 1; }
+          npulls qwen3.6:35b-a3b 11
+          expect 'Giving up on qwen3\.6:35b-a3b for now after 11 attempts\.'
+          reject 'after 10 attempts'
           label="a missing tag is never retried"
           FAKE_LIVE="" FAKE_PULL_SCRIPT="qwen3.6:35b-a3b=Z" sync 'Apple M4 Pro' 12 64 'y n n n y'
           [ "$SYNC_RC" -eq 1 ] || { echo "FAIL [$label]: expected exit 1, got $SYNC_RC"; exit 1; }

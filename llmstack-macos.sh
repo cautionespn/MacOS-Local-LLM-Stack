@@ -1608,7 +1608,8 @@ _blobs_dir() { printf '%s' "$OLLAMA_MODELS_DIR/blobs"; }
 _sum_blobs() {
   local d="$1" listing comp
   shift
-  listing="$("$@" ls -ln "$d" 2>/dev/null)" || return 0
+  # GNU ls rescales the size column when BLOCK_SIZE or LS_BLOCK_SIZE is set.
+  listing="$("$@" env -u BLOCK_SIZE -u LS_BLOCK_SIZE ls -ln "$d" 2>/dev/null)" || return 0
   comp="$("$@" find "$d" -maxdepth 1 -type f -name 'sha256-*-partial-*' -exec cat {} + 2>/dev/null \
     | grep -o '"Completed":[0-9][0-9]*' || true)"
   { printf '%s\n' "$listing" | awk 'NF >= 5 { print "L", $5, $NF }'
@@ -1646,8 +1647,10 @@ _pull_resuming() {
     [ "$(registry_probe "$tag")" = "LIVE" ] || return 1
     after="$(_saved_bytes)"
     if [ -z "$before" ] || [ -z "$after" ]; then
+      # n counts every attempt, so this also stops a pull that turns blind
+      # late (for example when cached sudo credentials expire).
       if [ "$n" -ge "$RESUME_BLIND_LIMIT" ]; then
-        warn "Giving up on $tag for now after $RESUME_BLIND_LIMIT attempts."
+        warn "Giving up on $tag for now after $n attempts."
         return 1
       fi
       warn "Attempt $n of $RESUME_BLIND_LIMIT was cut off (saved progress can't be read here). Resuming in $RESUME_PAUSE_S s (Ctrl-C stops)."

@@ -178,13 +178,13 @@ This mode brings installed models in line with the current picks. **The safety p
 7. **Pull** everything chosen. On Ctrl-C during a pull or a resume pause, say "Pull interrupted. Nothing was removed. Re-run to resume the download." and stop: bash traps `INT`; PowerShell, where a stop skips `catch` but runs `finally`, prints it from a `finally` guarded by "not done and no ordinary error", around the whole resume loop. If any pull fails, list the failures, say "no models were removed", and exit 1.
 
    **Resume a cut-off pull.** When a pull fails, probe its tag's manifest once with the registry check. Only a 200 means the download was cut off; then pull the tag again automatically, measuring how much Ollama has saved between attempts. Any other answer stops resuming that tag at once.
-   - **Saved progress** is read from the `blobs` folder of the platform's model store; each spec names the store and how it is read. It is the sizes of finished blob files (`sha256-` and 64 hex digits, no suffix) plus the `Completed` values in Ollama's part files (`sha256-<64 hex>-partial-<n>`, one JSON object each). Ollama discards the bytes of a reset connection and saves a part's progress only when its connection ends cleanly or the pull stops, so this is exactly what the next attempt keeps. It is Ollama's internal format, not an API (checked against `server/download.go` on main, 2026-10-19). If the folder is missing or can't be read, or a part file has no `Completed` number, progress is **unknown**.
+   - **Saved progress** is read from the `blobs` folder of the platform's model store; each spec names the store and how it is read. It is the sizes of finished blob files (read so that the user's environment can't rescale them: GNU `ls` obeys `BLOCK_SIZE` and `LS_BLOCK_SIZE`) (`sha256-` and 64 hex digits, no suffix) plus the `Completed` values in Ollama's part files (`sha256-<64 hex>-partial-<n>`, one JSON object each). Ollama discards the bytes of a reset connection and saves a part's progress only when its connection ends cleanly or the pull stops, so this is exactly what the next attempt keeps. It is Ollama's internal format, not an API (checked against `server/download.go` on main, 2026-10-19). If the folder is missing or can't be read, or a part file has no `Completed` number, progress is **unknown**.
    - Measure before the first attempt and after each failed one, then print one line and pause before the next attempt. Amounts are `<x.x> GB` (10^9 bytes), or `<n> MB` under 1 GB:
      - progress grew: "Attempt <n> was cut off; <amount> more is saved. Resuming in <pause> s (Ctrl-C stops)."
      - no growth: "Attempt <n> was cut off and saved nothing new (<k> of 3 in a row). Resuming in <pause> s (Ctrl-C stops)." On the third such attempt in a row, print "No progress in 3 attempts in a row; giving up on <tag> for now." instead, and stop. Growth resets the count.
-     - unknown (before or after the attempt): "Attempt <n> of 10 was cut off (saved progress can't be read here). Resuming in <pause> s (Ctrl-C stops)." On the tenth attempt, print "Giving up on <tag> for now after 10 attempts." instead, and stop.
+     - unknown (before or after the attempt): "Attempt <n> of 10 was cut off (saved progress can't be read here). Resuming in <pause> s (Ctrl-C stops)." On the tenth attempt or later (attempts are counted from the first, known progress included), print "Giving up on <tag> for now after <n> attempts." instead, and stop.
    - A tag that stops resuming is a failed pull. There is no cap while progress grows; the download's size bounds it.
-   - Constants: `RESUME_STALL_LIMIT=3`, `RESUME_BLIND_LIMIT=10`, `RESUME_PAUSE_S=10` (PowerShell: `$Script:ResumeStallLimit`, `$Script:ResumeBlindLimit`, `$Script:ResumePauseS`). Test hook: `LLMSTACK_RESUME_PAUSE=<seconds>` replaces the pause when it is all digits; anything else is ignored. It is not in the help.
+   - Constants: `RESUME_STALL_LIMIT=3`, `RESUME_BLIND_LIMIT=10`, `RESUME_PAUSE_S=10` (PowerShell: `$Script:ResumeStallLimit`, `$Script:ResumeBlindLimit`, `$Script:ResumePauseS`). Test hook: `LLMSTACK_RESUME_PAUSE=<seconds>` replaces the pause when it is all digits, with nothing else (not even a trailing newline); anything else is ignored. It is not in the help.
 
    **Say why each pull failed.** Ollama's own error does not tell a missing tag from a dropped connection, so probe each failed tag's manifest once with the registry check (the same endpoint and timeout) and print it with a reason:
    - 200: `download failed (the tag is in the registry)`
@@ -207,7 +207,7 @@ When stdin is a list of answers, as in tests, loops that prompt must not consume
 <!-- /SHARED:sync -->
 
 **Resuming on macOS.** The store is `~/.ollama/models` (`OLLAMA_MODELS_DIR`, the daemon's `OLLAMA_MODELS`). The daemon runs as the stack owner, who also runs `--sync-models`, so the `blobs` folder is read directly.
-- `_saved_bytes` prints the byte total, or nothing when progress is unknown. Finished sizes come from column 5 of `ls -ln`; part files are concatenated and their `"Completed":<n>` values summed with awk. If the number of part files differs from the number of `Completed` values, progress is unknown.
+- `_saved_bytes` prints the byte total, or nothing when progress is unknown. Finished sizes come from column 5 of `env -u BLOCK_SIZE -u LS_BLOCK_SIZE ls -ln`; part files are concatenated and their `"Completed":<n>` values summed with awk. If the number of part files differs from the number of `Completed` values, progress is unknown.
 - `_pull_resuming <tag>` runs the attempts and returns 0 or 1. `sync_models` calls it instead of a bare `ollama pull`. The pause is `sleep`, inside the `INT` trap.
 - `_human_bytes <n>` formats an amount as the contract says.
 
@@ -573,6 +573,8 @@ The README must cover:
     - `ZZPZZZ`: growth resets the count, so six pulls
     - `G`: ten pulls, "Attempt 9 of 10", then the give-up line
     - a missing tag (404) is pulled once, with no "Attempt" line
+    - no blobs folder before the first attempt: progress unknown, ten pulls
+    - `PPPPPPPPPPG`: progress becomes unknown at attempt 11, so it stops at once, "after 11 attempts"
   - the daemon down exits 1 with no calls
   - a missing marker is replaced only on yes, with a backup
   - an older generation is offered and the current one is not
