@@ -39,6 +39,7 @@ The deliverables are:
 
 - macOS on Apple Silicon (arm64) only. Refuse anything else in preflight, with a clear message.
 - zsh is the user shell.
+- The script runs under macOS's own `/bin/bash`, which is 3.2. Keep it 3.2-compatible and never require Homebrew bash: no `declare -A`, `mapfile`/`readarray`, `${var,,}`/`${var^^}`, namerefs, `&>>`, `|&` or `coproc`. Indexed arrays, `[[ =~ ]]` and `local` are fine; keep arrays non-empty or guard them, because 3.2 treats an empty array as unset under `set -u`. CI covers this only partly: `test-macos` runs `--recommend` and `--status` under 3.2, on pushes to main and manual runs only, outside the `CI Pass` gate; install, uninstall and refresh run under 3.2 only on real Macs. (An external review on 2026-10-19 claimed bash 4 was needed; it was wrong.)
 - Assume a fresh OS install with no console login: the machine is administered over SSH.
 - Make no assumption about user name or home path. Use `$HOME` and `id -un`, never `whoami`, which is deprecated.
 - Nothing specific to the author's network. Anything site-specific is a flag or a config value.
