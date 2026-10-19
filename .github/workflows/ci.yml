@@ -325,12 +325,14 @@ jobs:
               mkdir -p "$h/.config/llmstack"
               cp "$5" "$h/.config/llmstack/models.catalog"
             fi
+            # An installed stack has a blobs folder; resuming measures it.
+            [ -n "${SYNC_NO_BLOBS:-}" ] || mkdir -p "$h/.ollama/models/blobs"
             : > "$RUNNER_TEMP/ollama.log"
             # Not called inside $(...): SYNC_RC, SYNC_HOME and out must reach the step.
             SYNC_RC=0
             printf '%s\n' $4 | HOME="$h" PATH="$RUNNER_TEMP/fakebin:$RUNNER_TEMP/fakecurl:$PATH" \
               FAKE_CHIP="$1" FAKE_NCPU="$2" FAKE_RAM_GB="$3" FAKE_GPU="" \
-              FAKE_DISK_GB="${FAKE_DISK_GB:-500}" \
+              FAKE_DISK_GB="${FAKE_DISK_GB:-500}" LLMSTACK_RESUME_PAUSE=0 \
               FAKE_OLLAMA_LOG="$RUNNER_TEMP/ollama.log" \
               ./llmstack-macos.sh --sync-models > "$RUNNER_TEMP/sync.out" 2>&1 || SYNC_RC=$?
             SYNC_HOME="$h"
@@ -339,6 +341,7 @@ jobs:
           }
           called()     { grep -qxF -- "$1" "$RUNNER_TEMP/ollama.log" || { echo "FAIL [$label]: expected ollama call '$1'"; cat "$RUNNER_TEMP/ollama.log"; exit 1; }; echo "ok   [$label] called '$1'"; }
           not_called() { if grep -qxF -- "$1" "$RUNNER_TEMP/ollama.log"; then echo "FAIL [$label]: unexpected ollama call '$1'"; exit 1; fi; echo "ok   [$label] not called '$1'"; }
+          npulls()     { local got; got="$(grep -cxF -- "pull $1" "$RUNNER_TEMP/ollama.log" || true)"; [ "$got" -eq "$2" ] || { echo "FAIL [$label]: $got pulls of $1, expected $2"; cat "$RUNNER_TEMP/ollama.log"; exit 1; }; echo "ok   [$label] $2 pull(s) of $1"; }
           expect() { echo "$out" | grep -qE -- "$1" || { echo "FAIL [$label]: expected /$1/"; echo "$out"; exit 1; }; echo "ok   [$label] /$1/"; }
           reject() { if echo "$out" | grep -qE -- "$1"; then echo "FAIL [$label]: unexpected /$1/"; echo "$out"; exit 1; fi; echo "ok   [$label] not /$1/"; }
           EOF
@@ -359,7 +362,27 @@ jobs:
                 echo "$m    $id    4.1 GB    2 weeks ago"
               done ;;
             pull)
-              case " ${FAKE_PULL_FAIL:-} " in *" $2 "*) echo "Error: pull failed" >&2; exit 1 ;; esac ;;
+              case " ${FAKE_PULL_FAIL:-} " in *" $2 "*) echo "Error: pull failed" >&2; exit 1 ;; esac
+              # FAKE_PULL_SCRIPT="<tag>=<letters>", one letter per attempt, the
+              # last repeating. Writes what real Ollama leaves in the store:
+              # P cut off after saving 100 MB more (a part file's Completed),
+              # Z cut off saving nothing, G cut off leaving a part file with
+              # no Completed, O pulled (parts gone, finished blob written).
+              # The download file itself is sparse at full size, as Ollama's is.
+              for spec in ${FAKE_PULL_SCRIPT:-}; do
+                [ "${spec%%=*}" = "$2" ] || continue
+                letters="${spec#*=}"; b="$HOME/.ollama/models/blobs"
+                cf="$HOME/.fake-attempts-$2"; k=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 )); echo "$k" > "$cf"
+                l="${letters:$((k - 1)):1}"; [ -n "$l" ] || l="${letters: -1}"
+                d="sha256-$(printf '%s' "$2" | sha256sum | cut -c1-64)"
+                case "$l" in
+                  P) truncate -s 4000000000 "$b/$d-partial"
+                     printf '{"N":0,"Offset":0,"Size":4000000000,"Completed":%d}\n' $(( k * 100000000 )) > "$b/$d-partial-0" ;;
+                  G) truncate -s 4000000000 "$b/$d-partial"; printf '{"N":0,"Offset":0}\n' > "$b/$d-partial-0" ;;
+                  O) rm -f "$b/$d-partial" "$b/$d-partial-"*; head -c 1000 /dev/zero > "$b/$d"; exit 0 ;;
+                esac
+                echo "Error: max retries exceeded: read tcp: read: connection reset by peer" >&2; exit 1
+              done ;;
             rm) echo "deleted '$2'" ;;
             show)
               case " ${FAKE_EMBED:-} " in
@@ -606,6 +629,68 @@ jobs:
           expect 'qwen3.6:35b-a3b +registry unreachable'
           expect 'did not answer'
           reject 'Check the tag|VPN,'
+
+      # 3.7.0: a cut-off pull (the registry still serves the tag) resumes by
+      # itself while Ollama's saved progress grows. Picks prompt in the order
+      # qwen3.6, qwen3.8, coding, granite; then the llama3.3 removal.
+      - name: 'Sync: a cut-off pull resumes while it makes progress'
+        run: |
+          . "$RUNNER_TEMP/simulate.sh"
+          export FAKE_OLLAMA_MODELS="llama3.3:70b" FAKE_LIVE="qwen3.6:35b-a3b"
+          label="cut off twice with progress, then pulled"
+          FAKE_PULL_SCRIPT="qwen3.6:35b-a3b=PPO" sync 'Apple M4 Pro' 12 64 'y n n n y'
+          [ "$SYNC_RC" -eq 0 ] || { echo "FAIL [$label]: exit $SYNC_RC"; exit 1; }
+          npulls qwen3.6:35b-a3b 3
+          expect 'Attempt 1 was cut off; 100 MB more is saved\. Resuming in 0 s \(Ctrl-C stops\)\.'
+          expect 'Attempt 2 was cut off; 100 MB more is saved'
+          reject 'Attempt 3|giving up|Giving up|download failed'
+          called 'rm llama3.3:70b'
+          printf '%s\n' "$out" | awk '/^  Pulled:/ { getline; print }' | grep -q 'qwen3\.6:35b-a3b' \
+            || { echo "FAIL [$label]: not listed under Pulled"; exit 1; }
+          echo "ok   [$label] listed under Pulled"
+          label="no progress: three attempts, then give up"
+          FAKE_PULL_SCRIPT="qwen3.6:35b-a3b=Z" sync 'Apple M4 Pro' 12 64 'y n n n y'
+          [ "$SYNC_RC" -eq 1 ] || { echo "FAIL [$label]: expected exit 1, got $SYNC_RC"; exit 1; }
+          npulls qwen3.6:35b-a3b 3
+          expect 'Attempt 1 was cut off and saved nothing new \(1 of 3 in a row\)'
+          expect 'Attempt 2 was cut off and saved nothing new \(2 of 3 in a row\)'
+          reject '3 of 3 in a row'
+          expect 'No progress in 3 attempts in a row; giving up on qwen3\.6:35b-a3b for now\.'
+          expect 'qwen3\.6:35b-a3b +download failed \(the tag is in the registry\)'
+          not_called 'rm llama3.3:70b'
+          label="growth resets the no-progress count"
+          FAKE_PULL_SCRIPT="qwen3.6:35b-a3b=ZZPZZZ" sync 'Apple M4 Pro' 12 64 'y n n n y'
+          [ "$SYNC_RC" -eq 1 ] || { echo "FAIL [$label]: expected exit 1, got $SYNC_RC"; exit 1; }
+          npulls qwen3.6:35b-a3b 6
+          expect 'Attempt 3 was cut off; 300 MB more is saved'
+          expect 'Attempt 5 was cut off and saved nothing new \(2 of 3 in a row\)'
+          not_called 'rm llama3.3:70b'
+          label="progress can't be read: ten attempts"
+          FAKE_PULL_SCRIPT="qwen3.6:35b-a3b=G" sync 'Apple M4 Pro' 12 64 'y n n n y'
+          [ "$SYNC_RC" -eq 1 ] || { echo "FAIL [$label]: expected exit 1, got $SYNC_RC"; exit 1; }
+          npulls qwen3.6:35b-a3b 10
+          expect "Attempt 9 of 10 was cut off \\(saved progress can't be read here\\)"
+          reject 'Attempt 10 of 10'
+          expect 'Giving up on qwen3\.6:35b-a3b for now after 10 attempts\.'
+          not_called 'rm llama3.3:70b'
+          label="no blobs folder: progress unknown, ten attempts"
+          SYNC_NO_BLOBS=1 FAKE_PULL_SCRIPT="qwen3.6:35b-a3b=Z" sync 'Apple M4 Pro' 12 64 'y n n n y'
+          [ "$SYNC_RC" -eq 1 ] || { echo "FAIL [$label]: expected exit 1, got $SYNC_RC"; exit 1; }
+          npulls qwen3.6:35b-a3b 10
+          expect "Attempt 1 of 10 was cut off \\(saved progress can't be read here\\)"
+          expect 'Giving up on qwen3\.6:35b-a3b for now after 10 attempts\.'
+          label="progress turns unreadable late: stops at once with the real count"
+          FAKE_PULL_SCRIPT="qwen3.6:35b-a3b=PPPPPPPPPPG" sync 'Apple M4 Pro' 12 64 'y n n n y'
+          [ "$SYNC_RC" -eq 1 ] || { echo "FAIL [$label]: expected exit 1, got $SYNC_RC"; exit 1; }
+          npulls qwen3.6:35b-a3b 11
+          expect 'Giving up on qwen3\.6:35b-a3b for now after 11 attempts\.'
+          reject 'after 10 attempts'
+          label="a missing tag is never retried"
+          FAKE_LIVE="" FAKE_PULL_SCRIPT="qwen3.6:35b-a3b=Z" sync 'Apple M4 Pro' 12 64 'y n n n y'
+          [ "$SYNC_RC" -eq 1 ] || { echo "FAIL [$label]: expected exit 1, got $SYNC_RC"; exit 1; }
+          npulls qwen3.6:35b-a3b 1
+          reject 'Attempt 1'
+          expect 'qwen3\.6:35b-a3b +tag not found in the registry'
 
       - name: 'Sync: Ollama not running exits 1 and changes nothing'
         run: |
