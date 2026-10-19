@@ -434,7 +434,7 @@ The block is delimited by start and end markers. Re-running the installer **repl
    - `unchecked`: installed, but the registry couldn't be reached
 3. **Asks which missing picks to pull and which outdated ones to update**, once per model. A model serving several roles is asked about once.
 4. **Checks free disk** against the chosen downloads plus 10 GB of headroom, and stops with nothing changed if it's short.
-5. **Pulls everything you chose.** If any pull fails, nothing is removed.
+5. **Pulls everything you chose.** A download that is cut off resumes by itself (see below). If any pull still fails, nothing is removed.
 6. **Only then offers each other installed model for removal, one at a time.** Embedding models get an explicit warning, because Open WebUI may use them for document search.
 
 **How "outdated" is detected.** The ID `ollama list` shows is the start of the SHA-256 of the model's local manifest, and the registry serves that manifest byte for byte. If the digest of the registry's current manifest differs from your ID, a newer build has been published under the same tag. Checking takes one small request per pick, with no download. This matters because tags move: a `qwen3.6:35b-a3b` pulled seven weeks earlier had different weights from the one Ollama now serves. It also stopped sharing weights with the `-coding` tag, costing a second 22 GB copy until it was updated.
@@ -446,6 +446,14 @@ Old and new models coexist until the removal step, so you need room for both. If
 The size shown for each pick is its full download. Tags that share weights (like `qwen3.6:35b-a3b` and `qwen3.6:35b-a3b-coding`) are counted twice by the disk check, though Ollama stores the weights once — the check errs on the side of caution.
 
 If you remove the model Open WebUI uses as its default, choose a new default there. Existing chats remain readable.
+
+**When a download is cut off.** VPNs, proxies and security software sometimes reset long downloads. Ollama keeps what it has saved, so a pull can carry on where it stopped. When a pull fails and the registry still has the tag, `--sync-models` checks how much Ollama saved, waits 10 seconds and pulls again. It keeps going while each attempt saves more, and gives up after 3 attempts in a row that save nothing. Each attempt prints one line, for example:
+
+```
+WARNING: Attempt 2 was cut off; 3.4 GB more is saved. Resuming in 10 s (Ctrl-C stops).
+```
+
+Ctrl-C stops everything and removes nothing; running `--sync-models` again carries on from what was saved. A tag the registry doesn't have is never retried. The check reads Ollama's own progress files in `~/.ollama/models/blobs`. If they can't be read, the script tries up to 10 times in all instead.
 
 ---
 
@@ -799,6 +807,11 @@ A few choices worth explaining, since they're the ones people tend to want to ch
 ---
 
 ## Changelog
+
+### v3.7.0
+
+- **`--sync-models` resumes a cut-off download by itself.** When a pull fails and the registry still has the tag, the script measures what Ollama has saved, pauses 10 seconds and pulls again, printing how much the last attempt kept. It carries on while attempts keep saving more and gives up after 3 in a row that save nothing, or after 10 in all if Ollama's progress files can't be read. Ctrl-C still stops everything with nothing removed. Found on a work laptop whose security software reset a 23 GB download after 5.9 GB. Ollama keeps a part of a download only when its connection ends cleanly or the pull stops, so each attempt keeps a different amount, and 3.6.3 made you re-run by hand.
+- **Verified:** stub-tested in CI. The stub writes the same part files Ollama writes, and the cases cover progress then success, no progress, a count reset by progress, unreadable progress and a missing tag. The new checks were mutation-tested. **Not verified:** a real download cut off by a proxy; the progress-file format was read from Ollama's source (`server/download.go`, 2026-10-19), not observed on a machine.
 
 ### v3.6.3
 
